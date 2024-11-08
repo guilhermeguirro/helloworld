@@ -1,4 +1,4 @@
-name: Ansible Test Workflow
+name: Ansible Test
 on:
   push:
     branches: [ main ]
@@ -7,8 +7,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  test-ansible:
-    name: Test Ansible Playbooks
+  test:
+    name: Ansible Test
     runs-on: ubuntu-latest
     
     steps:
@@ -19,63 +19,54 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          # Remove cache option since we don't have requirements.txt yet
-          
-      - name: Create requirements file
-        run: |
-          cat << EOF > requirements.txt
-          ansible>=8.0.0
-          ansible-lint>=6.0.0
-          yamllint>=1.26.0
-          molecule>=5.0.0
-          molecule-docker>=2.0.0
-          EOF
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Display Ansible version
-        run: |
-          ansible --version
-          ansible-lint --version
-
-      - name: Create test inventory
-        run: |
-          mkdir -p tests/inventory
-          echo "localhost ansible_connection=local" > tests/inventory/hosts
+          pip install ansible==8.5.0
 
       - name: Create test playbook
         run: |
-          mkdir -p tests/playbooks
-          cat << EOF > tests/playbooks/test.yml
+          mkdir -p playbooks
+          cat << EOF > playbooks/test.yml
           ---
-          - name: Test playbook
+          - name: Test Playbook
             hosts: localhost
-            gather_facts: false
+            connection: local
+            gather_facts: yes
+            
             tasks:
-              - name: Print hello
+              - name: Print system info
                 debug:
-                  msg: "Hello from Ansible in GitHub Actions!"
+                  msg: "Running on {{ ansible_distribution }} {{ ansible_distribution_version }}"
               
-              - name: Check Python
-                command: python --version
-                register: python_version
+              - name: Create test directory
+                file:
+                  path: /tmp/ansible-test
+                  state: directory
+                  mode: '0755'
               
-              - name: Display Python version
+              - name: Create test file
+                copy:
+                  content: "Hello from Ansible!"
+                  dest: /tmp/ansible-test/hello.txt
+              
+              - name: Read test file
+                command: cat /tmp/ansible-test/hello.txt
+                register: file_content
+              
+              - name: Show file content
                 debug:
-                  var: python_version.stdout
+                  var: file_content.stdout
           EOF
 
-      - name: Lint playbooks
+      - name: Create inventory
         run: |
-          ansible-lint tests/playbooks/*.yml || true
+          mkdir -p inventory
+          echo "localhost ansible_connection=local" > inventory/hosts
 
       - name: Check playbook syntax
-        run: |
-          ansible-playbook tests/playbooks/test.yml --syntax-check
+        run: ansible-playbook playbooks/test.yml --syntax-check
 
-      - name: Run test playbook
-        run: |
-          ansible-playbook -i tests/inventory/hosts tests/playbooks/test.yml
+      - name: Run playbook
+        run: ansible-playbook -i inventory/hosts playbooks/test.yml

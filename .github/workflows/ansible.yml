@@ -1,219 +1,149 @@
+name: 🛡️ Security Setup
+
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
   workflow_dispatch:
+    inputs:
+      security_level:
+        description: '🔒 Security Level'
+        required: true
+        type: choice
+        options:
+          - standard
+          - enhanced
+      ssh_port:
+        description: '🔌 SSH Port'
+        required: true
+        default: '22'
+      admin_email:
+        description: '📧 Admin Email'
+        required: true
+        type: string
 
 jobs:
-  test-playbooks:
-    name: Test Ansible Playbooks
+  security-setup:
     runs-on: ubuntu-latest
-    
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+      - name: Input validation
+        run: |
+          if ! [[ "${{ github.event.inputs.ssh_port }}" =~ ^[0-9]+$ ]] || \
+             [ "${{ github.event.inputs.ssh_port }}" -lt 1 ] || \
+             [ "${{ github.event.inputs.ssh_port }}" -gt 65535 ]; then
+            echo "❌ Invalid SSH port"
+            exit 1
+          fi
+          if ! [[ "${{ github.event.inputs.admin_email }}" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+            echo "❌ Invalid email format"
+            exit 1
+          fi
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Install requirements
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ansible fail2ban ufw
+
+      - name: Create security playbook
+        run: |
+          cat > security.yml << 'EOF'
+          ---
+          - hosts: localhost
+            become: yes
+            vars:
+              security_level: "{{ lookup('env', 'SECURITY_LEVEL') }}"
+              ssh_port: "{{ lookup('env', 'SSH_PORT') }}"
+            
+            tasks:
+              - name: Configure SSH
+                template:
+                  src: sshd_config.j2
+                  dest: /etc/ssh/sshd_config
+                  mode: '0600'
+                notify: restart ssh
+
+              - name: Setup UFW rules
+                ufw:
+                  rule: allow
+                  port: "{{ item }}"
+                  proto: tcp
+                loop:
+                  - "{{ ssh_port }}"
+                  - "80"
+                  - "443"
+
+              - name: Enable UFW
+                ufw:
+                  state: enabled
+                  policy: deny
+
+              - name: Configure fail2ban
+                template:
+                  src: fail2ban.j2
+                  dest: /etc/fail2ban/jail.local
+                notify: restart fail2ban
+
+            handlers:
+              - name: restart ssh
+                service: name=ssh state=restarted
+
+              - name: restart fail2ban
+                service: name=fail2ban state=restarted
+          EOF
+
+      - name: Create SSH config template
+        run: |
+          cat > sshd_config.j2 << 'EOF'
+          Port {{ ssh_port }}
+          Protocol 2
+          PermitRootLogin no
+          MaxAuthTries {{ '3' if security_level == 'enhanced' else '5' }}
+          PasswordAuthentication {{ 'no' if security_level == 'enhanced' else 'yes' }}
+          PermitEmptyPasswords no
+          X11Forwarding no
+          ClientAliveInterval 300
+          EOF
+
+      - name: Create fail2ban template
+        run: |
+          cat > fail2ban.j2 << 'EOF'
+          [DEFAULT]
+          bantime = {{ '24h' if security_level == 'enhanced' else '12h' }}
+          findtime = 30m
+          maxretry = {{ '3' if security_level == 'enhanced' else '5' }}
+
+          [sshd]
+          enabled = true
+          port = {{ ssh_port }}
+          filter = sshd
+          logpath = /var/log/auth.log
+          EOF
+
+      - name: Run security setup
+        env:
+          SECURITY_LEVEL: ${{ github.event.inputs.security_level }}
+          SSH_PORT: ${{ github.event.inputs.ssh_port }}
+        run: |
+          ansible-playbook security.yml -v
+
+      - name: Generate report
+        run: |
+          echo "🛡️ Security Setup Report" > report.txt
+          echo "=========================" >> report.txt
+          echo "Date: $(date)" >> report.txt
+          echo "Security Level: ${{ github.event.inputs.security_level }}" >> report.txt
+          echo "SSH Port: ${{ github.event.inputs.ssh_port }}" >> report.txt
+          echo "UFW Status:" >> report.txt
+          sudo ufw status >> report.txt
+          echo "Fail2ban Status:" >> report.txt
+          sudo fail2ban-client status >> report.txt
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
         with:
-          python-version: '3.10'
+          name: security-report
+          path: report.txt
+          retention-days: 7
 
-      - name: Install dependencies
+      - name: Send notification
+        if: failure()
         run: |
-          python -m pip install --upgrade pip
-          pip install ansible==8.5.0
-
-      - name: Create playbook directory
-        run: mkdir -p playbooks
-
-      - name: Create NGINX playbook
-        run: |
-          cat << 'EOF' > playbooks/nginx.yml
-          ---
-          - name: Install and Configure NGINX
-            hosts: localhost
-            become: yes
-            tasks:
-              - name: Install NGINX
-                apt:
-                  name: nginx
-                  state: present
-                  update_cache: yes
-
-              - name: Create custom index.html
-                copy:
-                  content: |
-                    <!DOCTYPE html>
-                    <html>
-                    <head><title>Welcome to NGINX!</title></head>
-                    <body>
-                      <h1>Hello from Ansible-configured NGINX!</h1>
-                      <p>If you see this, the playbook worked.</p>
-                    </body>
-                    </html>
-                  dest: /var/www/html/index.html
-
-              - name: Ensure NGINX is running
-                service:
-                  name: nginx
-                  state: started
-                  enabled: yes
-
-              - name: Check NGINX status
-                command: systemctl status nginx
-                register: nginx_status
-
-              - name: Display NGINX status
-                debug:
-                  var: nginx_status.stdout_lines
-          EOF
-
-      - name: Create Node.js playbook
-        run: |
-          cat << 'EOF' > playbooks/nodejs.yml
-          ---
-          - name: Install and Configure Node.js
-            hosts: localhost
-            become: yes
-            tasks:
-              - name: Install Node.js and npm
-                apt:
-                  name: 
-                    - nodejs
-                    - npm
-                  state: present
-                  update_cache: yes
-
-              - name: Check Node.js version
-                command: node --version
-                register: node_version
-
-              - name: Check npm version
-                command: npm --version
-                register: npm_version
-
-              - name: Display versions
-                debug:
-                  msg: 
-                    - "Node.js version: {{ node_version.stdout }}"
-                    - "npm version: {{ npm_version.stdout }}"
-          EOF
-
-      - name: Create Apache playbook
-        run: |
-          cat << 'EOF' > playbooks/apache.yml
-          ---
-          - name: Install and Configure Apache
-            hosts: localhost
-            become: yes
-            tasks:
-              - name: Install Apache
-                apt:
-                  name: apache2
-                  state: present
-                  update_cache: yes
-
-              - name: Create custom index.html
-                copy:
-                  content: |
-                    <!DOCTYPE html>
-                    <html>
-                    <head><title>Apache Test Page</title></head>
-                    <body>
-                      <h1>Hello from Ansible-configured Apache!</h1>
-                      <p>If you see this, the playbook worked.</p>
-                    </body>
-                    </html>
-                  dest: /var/www/html/index.html
-
-              - name: Ensure Apache is running
-                service:
-                  name: apache2
-                  state: started
-                  enabled: yes
-          EOF
-
-      - name: Create MySQL playbook
-        run: |
-          cat << 'EOF' > playbooks/mysql.yml
-          ---
-          - name: Install and Configure MySQL
-            hosts: localhost
-            become: yes
-            tasks:
-              - name: Install MySQL
-                apt:
-                  name: 
-                    - mysql-server
-                    - python3-pymysql
-                  state: present
-                  update_cache: yes
-
-              - name: Ensure MySQL is running
-                service:
-                  name: mysql
-                  state: started
-                  enabled: yes
-
-              - name: Check MySQL version
-                command: mysql --version
-                register: mysql_version
-
-              - name: Display MySQL version
-                debug:
-                  var: mysql_version.stdout
-          EOF
-
-      - name: Create Redis playbook
-        run: |
-          cat << 'EOF' > playbooks/redis.yml
-          ---
-          - name: Install and Configure Redis
-            hosts: localhost
-            become: yes
-            tasks:
-              - name: Install Redis
-                apt:
-                  name: redis-server
-                  state: present
-                  update_cache: yes
-
-              - name: Ensure Redis is running
-                service:
-                  name: redis-server
-                  state: started
-                  enabled: yes
-
-              - name: Check Redis status
-                command: systemctl status redis-server
-                register: redis_status
-
-              - name: Display Redis status
-                debug:
-                  var: redis_status.stdout_lines
-          EOF
-
-      - name: Create inventory
-        run: |
-          mkdir -p inventory
-          echo "localhost ansible_connection=local" > inventory/hosts
-
-      - name: Check playbook syntax
-        run: |
-          for playbook in playbooks/*.yml; do
-            echo "Checking syntax for $playbook"
-            ansible-playbook "$playbook" --syntax-check
-          done
-
-      - name: Run NGINX playbook
-        run: ansible-playbook -i inventory/hosts playbooks/nginx.yml
-
-      - name: Run Node.js playbook
-        run: ansible-playbook -i inventory/hosts playbooks/nodejs.yml
-
-      - name: Run MySQL playbook
-        run: ansible-playbook -i inventory/hosts playbooks/mysql.yml
-
-      - name: Run Redis playbook
-        run: ansible-playbook -i inventory/hosts playbooks/redis.yml
+          echo "Security setup failed! Check the logs." | \
+          mail -s "Security Setup Failed" ${{ github.event.inputs.admin_email }}

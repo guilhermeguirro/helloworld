@@ -1,0 +1,345 @@
+name: 🛡️ Security & Infrastructure Setup
+
+on:
+  workflow_dispatch:
+    inputs:
+      security_level:
+        description: '🔒 Security Level'
+        required: true
+        type: choice
+        options:
+          - standard
+          - enhanced
+          - fortress
+      enable_monitoring:
+        description: '📊 Enable Monitoring'
+        type: boolean
+        default: true
+      enable_notifications:
+        description: '📧 Enable Email Notifications'
+        type: boolean
+        default: true
+      ssh_port:
+        description: '🔌 Custom SSH Port (default: 22)'
+        required: true
+        default: '22'
+      admin_email:
+        description: '📧 Admin Email for Notifications'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  security-setup:
+    name: 🛡️ Security Configuration
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ansible==8.5.0 ansible-lint ansible-core
+          sudo apt-get update
+          sudo apt-get install -y sshpass
+
+      - name: Verify SSH port
+        run: |
+          if ! [[ "${{ github.event.inputs.ssh_port }}" =~ ^[0-9]+$ ]] || \
+             [ "${{ github.event.inputs.ssh_port }}" -lt 1 ] || \
+             [ "${{ github.event.inputs.ssh_port }}" -gt 65535 ]; then
+            echo "Error: Invalid SSH port number"
+            exit 1
+          fi
+
+      - name: Verify email format
+        run: |
+          if ! [[ "${{ github.event.inputs.admin_email }}" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+            echo "Error: Invalid email format"
+            exit 1
+          fi
+
+      - name: Create directories
+        run: |
+          mkdir -p {playbooks,templates,inventory,group_vars}
+          chmod 750 {playbooks,templates,inventory,group_vars}
+
+      - name: Create fail2ban template
+        run: |
+          cat > templates/fail2ban.conf.j2 << 'ENDOFFILE'
+          [DEFAULT]
+          bantime = {{ '48h' if security_level == 'fortress' else '24h' if security_level == 'enhanced' else '12h' }}
+          findtime = {{ '10m' if security_level == 'fortress' else '30m' }}
+          maxretry = {{ '3' if security_level == 'fortress' else '5' if security_level == 'enhanced' else '7' }}
+          banaction = iptables-multiport
+          mta = sendmail
+          protocol = tcp
+          chain = INPUT
+          ignoreip = 127.0.0.1/8 ::1
+
+          [sshd]
+          enabled = true
+          port = {{ ssh_port }}
+          filter = sshd
+          logpath = /var/log/auth.log
+          maxretry = {{ '2' if security_level == 'fortress' else '3' if security_level == 'enhanced' else '5' }}
+
+          [http-auth]
+          enabled = true
+          port = http,https
+          filter = apache-auth
+          logpath = /var/log/apache2/error.log /var/log/nginx/error.log
+          maxretry = {{ '3' if security_level == 'fortress' else '5' }}
+          ENDOFFILE
+          chmod 640 templates/fail2ban.conf.j2
+
+      - name: Create SSH config template
+        run: |
+          cat > templates/sshd_config.j2 << 'ENDOFFILE'
+          Port {{ ssh_port }}
+          Protocol 2
+          PermitRootLogin no
+          MaxAuthTries {{ '2' if security_level == 'fortress' else '3' if security_level == 'enhanced' else '5' }}
+          PubkeyAuthentication yes
+          PasswordAuthentication {{ 'no' if security_level == 'fortress' else 'no' if security_level == 'enhanced' else 'yes' }}
+          PermitEmptyPasswords no
+          X11Forwarding no
+          ClientAliveInterval 300
+          ClientAliveCountMax 2
+          AllowTcpForwarding {{ 'no' if security_level == 'fortress' else 'local' if security_level == 'enhanced' else 'yes' }}
+          MaxStartups 10:30:60
+          LoginGraceTime 30
+          StrictModes yes
+          ENDOFFILE
+          chmod 640 templates/sshd_config.j2
+
+      - name: Create security rules template
+        run: |
+          cat > templates/security.rules.j2 << 'ENDOFFILE'
+          # System security settings
+          kernel.randomize_va_space = 2
+          kernel.kptr_restrict = 2
+          kernel.yama.ptrace_scope = 1
+          kernel.sysrq = 0
+          
+          # Network security settings
+          net.ipv4.conf.all.rp_filter = 1
+          net.ipv4.conf.default.rp_filter = 1
+          net.ipv4.icmp_echo_ignore_broadcasts = 1
+          net.ipv4.conf.all.accept_redirects = 0
+          net.ipv4.conf.all.secure_redirects = 0
+          net.ipv4.conf.all.accept_source_route = 0
+          net.ipv4.tcp_syncookies = 1
+          net.ipv4.tcp_max_syn_backlog = 2048
+          net.ipv4.tcp_synack_retries = 2
+          net.ipv4.tcp_syn_retries = 5
+          
+          # IPv6 security settings
+          net.ipv6.conf.all.accept_redirects = 0
+          net.ipv6.conf.default.accept_redirects = 0
+          net.ipv6.conf.all.accept_source_route = 0
+          ENDOFFILE
+          chmod 640 templates/security.rules.j2
+
+      - name: Create monitoring config
+        if: ${{ github.event.inputs.enable_monitoring == 'true' }}
+        run: |
+          cat > templates/monitoring.conf.j2 << 'ENDOFFILE'
+          # Monitoring configuration
+          net.ipv4.tcp_timestamps = 0
+          kernel.panic = 60
+          kernel.panic_on_oops = 60
+          ENDOFFILE
+          chmod 640 templates/monitoring.conf.j2
+
+      - name: Create Ansible playbook
+        run: |
+          cat > playbooks/security.yml << 'ENDOFFILE'
+          ---
+          - name: Security Configuration
+            hosts: localhost
+            become: yes
+            vars:
+              security_level: "{{ lookup('env', 'INPUT_SECURITY_LEVEL') }}"
+              ssh_port: "{{ lookup('env', 'INPUT_SSH_PORT') }}"
+              admin_email: "{{ lookup('env', 'INPUT_ADMIN_EMAIL') }}"
+              enable_monitoring: "{{ lookup('env', 'INPUT_ENABLE_MONITORING') | bool }}"
+              enable_notifications: "{{ lookup('env', 'INPUT_ENABLE_NOTIFICATIONS') | bool }}"
+            
+            pre_tasks:
+              - name: Check if system is supported
+                fail:
+                  msg: "This playbook only supports Ubuntu/Debian systems"
+                when: ansible_os_family != "Debian"
+                
+            tasks:
+              - name: Update apt cache
+                apt:
+                  update_cache: yes
+                  cache_valid_time: 3600
+                register: apt_update
+                retries: 3
+                delay: 10
+                until: apt_update is success
+
+              - name: Install security packages
+                apt:
+                  name:
+                    - fail2ban
+                    - ufw
+                    - unattended-upgrades
+                    - rkhunter
+                    - auditd
+                    - aide
+                    - apparmor
+                    - apparmor-utils
+                  state: present
+                  install_recommends: yes
+                register: pkg_install
+                retries: 3
+                delay: 10
+                until: pkg_install is success
+
+              - name: Configure fail2ban
+                template:
+                  src: fail2ban.conf.j2
+                  dest: /etc/fail2ban/jail.local
+                  mode: '0644'
+                  owner: root
+                  group: root
+                  validate: 'fail2ban-client -t -x'
+                notify: restart fail2ban
+
+              - name: Configure UFW
+                ufw:
+                  rule: allow
+                  port: "{{ item }}"
+                  proto: tcp
+                loop:
+                  - "{{ ssh_port }}"
+                  - "80"
+                  - "443"
+
+              - name: Enable UFW
+                ufw:
+                  state: enabled
+                  policy: deny
+                  logging: on
+
+              - name: Configure security rules
+                template:
+                  src: security.rules.j2
+                  dest: /etc/sysctl.d/90-security.conf
+                  mode: '0644'
+                  owner: root
+                  group: root
+                notify: reload sysctl
+
+              - name: Configure monitoring
+                template:
+                  src: monitoring.conf.j2
+                  dest: /etc/sysctl.d/91-monitoring.conf
+                  mode: '0644'
+                  owner: root
+                  group: root
+                notify: reload sysctl
+                when: enable_monitoring
+
+              - name: Setup automatic updates
+                template:
+                  src: templates/auto-upgrades.j2
+                  dest: /etc/apt/apt.conf.d/20auto-upgrades
+                  mode: '0644'
+                  owner: root
+                  group: root
+                notify: restart unattended-upgrades
+
+              - name: Initialize AIDE database
+                command: aide --init
+                args:
+                  creates: /var/lib/aide/aide.db.new
+                when: security_level in ['enhanced', 'fortress']
+
+              - name: Enable AppArmor
+                service:
+                  name: apparmor
+                  state: started
+                  enabled: yes
+                when: security_level in ['enhanced', 'fortress']
+
+              - name: Generate security report
+                template:
+                  src: templates/security_report.j2
+                  dest: security_report.txt
+                  mode: '0644'
+
+            handlers:
+              - name: restart fail2ban
+                service:
+                  name: fail2ban
+                  state: restarted
+                  enabled: yes
+
+              - name: reload sysctl
+                command: sysctl --system
+
+              - name: restart unattended-upgrades
+                service:
+                  name: unattended-upgrades
+                  state: restarted
+                  enabled: yes
+          ENDOFFILE
+          chmod 640 playbooks/security.yml
+
+      - name: Create inventory file
+        run: |
+          echo "localhost ansible_connection=local ansible_python_interpreter=/usr/bin/python3" > inventory/hosts
+          chmod 640 inventory/hosts
+
+      - name: Verify Ansible syntax
+        run: |
+          ansible-playbook --syntax-check -i inventory/hosts playbooks/security.yml
+
+      - name: Run Ansible playbook
+        env:
+          INPUT_SECURITY_LEVEL: ${{ github.event.inputs.security_level }}
+          INPUT_SSH_PORT: ${{ github.event.inputs.ssh_port }}
+          INPUT_ADMIN_EMAIL: ${{ github.event.inputs.admin_email }}
+          INPUT_ENABLE_MONITORING: ${{ github.event.inputs.enable_monitoring }}
+          INPUT_ENABLE_NOTIFICATIONS: ${{ github.event.inputs.enable_notifications }}
+          ANSIBLE_HOST_KEY_CHECKING: false
+        run: |
+          ansible-playbook -i inventory/hosts playbooks/security.yml -v
+
+      - name: Upload security report
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-report
+          path: security_report.txt
+          retention-days: 30
+
+      - name: Notify on failure
+        if: failure() && github.event.inputs.enable_notifications == 'true'
+        run: |
+          echo "Security setup failed! Check the workflow logs for details." | \
+          mail -s "Security Setup Failed" ${{ github.event.inputs.admin_email }}
+
+      - name: Show completion message
+        run: |
+          echo "🎉 Security setup completed successfully!"
+          echo "Security Level: ${{ github.event.inputs.security_level }}"
+          echo "SSH Port: ${{ github.event.inputs.ssh_port }}"
+          echo "Monitoring: ${{ github.event.inputs.enable_monitoring }}"
+          echo "Check the security report for complete details."

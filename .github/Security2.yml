@@ -1,0 +1,235 @@
+name: 🛡️ Security & Infrastructure Setup
+on:
+  workflow_dispatch:
+    inputs:
+      security_level:
+        description: '🔒 Security Level'
+        required: true
+        type: choice
+        options:
+          - standard
+          - enhanced
+          - fortress
+      enable_monitoring:
+        description: '📊 Enable Monitoring'
+        type: boolean
+        default: true
+      enable_notifications:
+        description: '📧 Enable Email Notifications'
+        type: boolean
+        default: true
+      ssh_port:
+        description: '🔌 Custom SSH Port (default: 22)'
+        required: true
+        default: '22'
+      admin_email:
+        description: '📧 Admin Email for Notifications'
+        required: true
+        type: string
+
+jobs:
+  security-setup:
+    name: 🛡️ Security Configuration
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ansible==8.5.0 ansible-lint
+
+      - name: Create directories
+        run: |
+          mkdir -p playbooks templates inventory group_vars
+
+      - name: Create fail2ban template
+        run: |
+          cat > templates/fail2ban.conf.j2 << 'ENDOFFILE'
+          [DEFAULT]
+          bantime = {{ '48h' if security_level == 'fortress' else '24h' if security_level == 'enhanced' else '12h' }}
+          findtime = {{ '10m' if security_level == 'fortress' else '30m' }}
+          maxretry = {{ '3' if security_level == 'fortress' else '5' if security_level == 'enhanced' else '7' }}
+          banaction = iptables-multiport
+          mta = sendmail
+          protocol = tcp
+          chain = INPUT
+
+          [sshd]
+          enabled = true
+          port = {{ ssh_port }}
+          filter = sshd
+          logpath = /var/log/auth.log
+          maxretry = {{ '2' if security_level == 'fortress' else '3' if security_level == 'enhanced' else '5' }}
+
+          [http-auth]
+          enabled = true
+          port = http,https
+          filter = apache-auth
+          logpath = /var/log/apache2/error.log /var/log/nginx/error.log
+          maxretry = {{ '3' if security_level == 'fortress' else '5' }}
+          ENDOFFILE
+
+      - name: Create SSH config template
+        run: |
+          cat > templates/sshd_config.j2 << 'ENDOFFILE'
+          Port {{ ssh_port }}
+          Protocol 2
+          PermitRootLogin no
+          MaxAuthTries {{ '2' if security_level == 'fortress' else '3' if security_level == 'enhanced' else '5' }}
+          PubkeyAuthentication yes
+          PasswordAuthentication {{ 'no' if security_level == 'fortress' else 'no' if security_level == 'enhanced' else 'yes' }}
+          PermitEmptyPasswords no
+          X11Forwarding no
+          ClientAliveInterval 300
+          ClientAliveCountMax 2
+          ENDOFFILE
+
+      - name: Create security rules template
+        run: |
+          cat > templates/security.rules.j2 << 'ENDOFFILE'
+          kernel.randomize_va_space = 2
+          net.ipv4.conf.all.rp_filter = 1
+          net.ipv4.conf.default.rp_filter = 1
+          net.ipv4.icmp_echo_ignore_broadcasts = 1
+          net.ipv4.conf.all.accept_redirects = 0
+          net.ipv4.conf.all.secure_redirects = 0
+          net.ipv4.conf.all.accept_source_route = 0
+          net.ipv6.conf.all.accept_redirects = 0
+          net.ipv6.conf.default.accept_redirects = 0
+          ENDOFFILE
+
+      - name: Create Ansible playbook
+        run: |
+          cat > playbooks/security.yml << 'ENDOFFILE'
+          ---
+          - name: Security Configuration
+            hosts: localhost
+            become: yes
+            vars:
+              security_level: "{{ lookup('env', 'INPUT_SECURITY_LEVEL') }}"
+              ssh_port: "{{ lookup('env', 'INPUT_SSH_PORT') }}"
+              admin_email: "{{ lookup('env', 'INPUT_ADMIN_EMAIL') }}"
+              enable_monitoring: "{{ lookup('env', 'INPUT_ENABLE_MONITORING') | bool }}"
+              enable_notifications: "{{ lookup('env', 'INPUT_ENABLE_NOTIFICATIONS') | bool }}"
+            
+            tasks:
+              - name: Update apt cache
+                apt:
+                  update_cache: yes
+                  cache_valid_time: 3600
+
+              - name: Install security packages
+                apt:
+                  name:
+                    - fail2ban
+                    - ufw
+                    - unattended-upgrades
+                    - rkhunter
+                    - auditd
+                  state: present
+
+              - name: Configure fail2ban
+                template:
+                  src: fail2ban.conf.j2
+                  dest: /etc/fail2ban/jail.local
+                  mode: '0644'
+                notify: restart fail2ban
+
+              - name: Configure UFW
+                ufw:
+                  rule: allow
+                  port: "{{ item }}"
+                  proto: tcp
+                loop:
+                  - "{{ ssh_port }}"
+                  - "80"
+                  - "443"
+
+              - name: Enable UFW
+                ufw:
+                  state: enabled
+                  policy: deny
+
+              - name: Configure security rules
+                template:
+                  src: security.rules.j2
+                  dest: /etc/sysctl.d/90-security.conf
+                  mode: '0644'
+                notify: reload sysctl
+
+              - name: Setup automatic updates
+                copy:
+                  content: |
+                    APT::Periodic::Update-Package-Lists "1";
+                    APT::Periodic::Unattended-Upgrade "1";
+                  dest: /etc/apt/apt.conf.d/20auto-upgrades
+                  mode: '0644'
+
+              - name: Generate security report
+                copy:
+                  content: |
+                    Security Setup Report
+                    ====================
+                    Date: {{ ansible_date_time.iso8601 }}
+                    
+                    Configuration:
+                    - Security Level: {{ security_level }}
+                    - SSH Port: {{ ssh_port }}
+                    - Monitoring: {{ enable_monitoring }}
+                    - Notifications: {{ enable_notifications }}
+                    
+                    Package Status:
+                    - Fail2ban: {{ ansible_facts.packages['fail2ban'][0].version }}
+                    - UFW: {{ ansible_facts.packages['ufw'][0].version }}
+                    
+                    Security Status:
+                    - UFW: Enabled
+                    - Fail2ban: Active
+                    - Automatic Updates: Configured
+                  dest: security_report.txt
+                  mode: '0644'
+
+            handlers:
+              - name: restart fail2ban
+                service:
+                  name: fail2ban
+                  state: restarted
+
+              - name: reload sysctl
+                command: sysctl --system
+          ENDOFFILE
+
+      - name: Create inventory file
+        run: |
+          echo "localhost ansible_connection=local" > inventory/hosts
+
+      - name: Run Ansible playbook
+        env:
+          INPUT_SECURITY_LEVEL: ${{ github.event.inputs.security_level }}
+          INPUT_SSH_PORT: ${{ github.event.inputs.ssh_port }}
+          INPUT_ADMIN_EMAIL: ${{ github.event.inputs.admin_email }}
+          INPUT_ENABLE_MONITORING: ${{ github.event.inputs.enable_monitoring }}
+          INPUT_ENABLE_NOTIFICATIONS: ${{ github.event.inputs.enable_notifications }}
+        run: |
+          ansible-playbook -i inventory/hosts playbooks/security.yml -v
+
+      - name: Upload security report
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-report
+          path: security_report.txt
+          retention-days: 30
+
+      - name: Show completion message
+        run: |
+          echo "🎉 Security setup completed successfully!"
+          echo "Security Level: ${{ github.event.inputs.security_level }}"
+          echo "Check the security report for details."

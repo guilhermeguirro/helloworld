@@ -1,0 +1,149 @@
+name: 🛡️ Security Setup v2
+
+on:
+  workflow_dispatch:
+    inputs:
+      security_level:
+        description: '🔒 Security Level'
+        required: true
+        type: choice
+        options:
+          - standard
+          - enhanced
+      ssh_port:
+        description: '🔌 SSH Port'
+        required: true
+        default: '22'
+      admin_email:
+        description: '📧 Admin Email'
+        required: true
+        type: string
+
+jobs:
+  security-setup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Input validation
+        run: |
+          if ! [[ "${{ github.event.inputs.ssh_port }}" =~ ^[0-9]+$ ]] || \
+             [ "${{ github.event.inputs.ssh_port }}" -lt 1 ] || \
+             [ "${{ github.event.inputs.ssh_port }}" -gt 65535 ]; then
+            echo "❌ Invalid SSH port"
+            exit 1
+          fi
+          if ! [[ "${{ github.event.inputs.admin_email }}" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+            echo "❌ Invalid email format"
+            exit 1
+          fi
+
+      - name: Install requirements
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ansible fail2ban ufw
+
+      - name: Create security playbook
+        run: |
+          cat > security.yml << 'EOF'
+          ---
+          - hosts: localhost
+            become: yes
+            vars:
+              security_level: "{{ lookup('env', 'SECURITY_LEVEL') }}"
+              ssh_port: "{{ lookup('env', 'SSH_PORT') }}"
+            
+            tasks:
+              - name: Configure SSH
+                template:
+                  src: sshd_config.j2
+                  dest: /etc/ssh/sshd_config
+                  mode: '0600'
+                notify: restart ssh
+
+              - name: Setup UFW rules
+                ufw:
+                  rule: allow
+                  port: "{{ item }}"
+                  proto: tcp
+                loop:
+                  - "{{ ssh_port }}"
+                  - "80"
+                  - "443"
+
+              - name: Enable UFW
+                ufw:
+                  state: enabled
+                  policy: deny
+
+              - name: Configure fail2ban
+                template:
+                  src: fail2ban.j2
+                  dest: /etc/fail2ban/jail.local
+                notify: restart fail2ban
+
+            handlers:
+              - name: restart ssh
+                service: name=ssh state=restarted
+
+              - name: restart fail2ban
+                service: name=fail2ban state=restarted
+          EOF
+
+      - name: Create SSH config template
+        run: |
+          cat > sshd_config.j2 << 'EOF'
+          Port {{ ssh_port }}
+          Protocol 2
+          PermitRootLogin no
+          MaxAuthTries {{ '3' if security_level == 'enhanced' else '5' }}
+          PasswordAuthentication {{ 'no' if security_level == 'enhanced' else 'yes' }}
+          PermitEmptyPasswords no
+          X11Forwarding no
+          ClientAliveInterval 300
+          EOF
+
+      - name: Create fail2ban template
+        run: |
+          cat > fail2ban.j2 << 'EOF'
+          [DEFAULT]
+          bantime = {{ '24h' if security_level == 'enhanced' else '12h' }}
+          findtime = 30m
+          maxretry = {{ '3' if security_level == 'enhanced' else '5' }}
+
+          [sshd]
+          enabled = true
+          port = {{ ssh_port }}
+          filter = sshd
+          logpath = /var/log/auth.log
+          EOF
+
+      - name: Run security setup
+        env:
+          SECURITY_LEVEL: ${{ github.event.inputs.security_level }}
+          SSH_PORT: ${{ github.event.inputs.ssh_port }}
+        run: |
+          ansible-playbook security.yml -v
+
+      - name: Generate report
+        run: |
+          echo "🛡️ Security Setup Report" > report.txt
+          echo "=========================" >> report.txt
+          echo "Date: $(date)" >> report.txt
+          echo "Security Level: ${{ github.event.inputs.security_level }}" >> report.txt
+          echo "SSH Port: ${{ github.event.inputs.ssh_port }}" >> report.txt
+          echo "UFW Status:" >> report.txt
+          sudo ufw status >> report.txt
+          echo "Fail2ban Status:" >> report.txt
+          sudo fail2ban-client status >> report.txt
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-report
+          path: report.txt
+          retention-days: 7
+
+      - name: Send notification
+        if: failure()
+        run: |
+          echo "Security setup failed! Check the logs." | \
+          mail -s "Security Setup Failed" ${{ github.event.inputs.admin_email }}

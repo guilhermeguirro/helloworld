@@ -1,0 +1,293 @@
+# File: .github/workflows/security-setup.yml
+name: 🛡️ Security & Infrastructure Setup
+on:
+  workflow_dispatch:
+    inputs:
+      security_level:
+        description: '🔒 Security Level'
+        required: true
+        type: choice
+        options:
+          - standard
+          - enhanced
+          - fortress
+      enable_monitoring:
+        description: '📊 Enable Monitoring'
+        type: boolean
+        default: true
+      enable_notifications:
+        description: '📧 Enable Email Notifications'
+        type: boolean
+        default: true
+      ssh_port:
+        description: '🔌 Custom SSH Port (default: 22)'
+        required: true
+        default: '22'
+      admin_email:
+        description: '📧 Admin Email for Notifications'
+        required: true
+        type: string
+
+jobs:
+  security-setup:
+    name: 🛡️ Security Configuration
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ansible==8.5.0 ansible-lint
+
+      - name: Create directory structure
+        run: |
+          mkdir -p {playbooks,templates,inventory,group_vars}
+
+      - name: Create templates
+        run: |
+          # Create fail2ban configuration
+          cat << 'EOF' > templates/fail2ban.conf.j2
+          [DEFAULT]
+          bantime = {{ '48h' if security_level == 'fortress' else '24h' if security_level == 'enhanced' else '12h' }}
+          findtime = {{ '10m' if security_level == 'fortress' else '30m' }}
+          maxretry = {{ '3' if security_level == 'fortress' else '5' if security_level == 'enhanced' else '7' }}
+          banaction = iptables-multiport
+          mta = sendmail
+          protocol = tcp
+          chain = INPUT
+          action_ = %(banaction)s[name=%(__name__)s, port="%(port)s", protocol="%(protocol)s", chain="%(chain)s"]
+          action_mw = %(action_)s
+                     %(mta)s-whois[name=%(__name__)s, sender="%(sender)s"]
+          action = %(action_mw)s
+
+          [sshd]
+          enabled = true
+          port = {{ ssh_port }}
+          filter = sshd
+          logpath = /var/log/auth.log
+          maxretry = {{ '2' if security_level == 'fortress' else '3' if security_level == 'enhanced' else '5' }}
+          
+          [http-auth]
+          enabled = true
+          port = http,https
+          filter = apache-auth
+          logpath = /var/log/apache2/error.log /var/log/nginx/error.log
+          maxretry = {{ '3' if security_level == 'fortress' else '5' }}
+          
+          [http-scan]
+          enabled = true
+          port = http,https
+          filter = http-scan
+          logpath = /var/log/apache2/error.log /var/log/nginx/error.log
+          maxretry = 2
+          findtime = 300
+          bantime = 48h
+          EOF
+          
+          # Create security rules
+          cat << 'EOF' > templates/security.rules.j2
+          # System security settings
+          kernel.randomize_va_space = 2
+          net.ipv4.conf.all.rp_filter = 1
+          net.ipv4.conf.default.rp_filter = 1
+          net.ipv4.icmp_echo_ignore_broadcasts = 1
+          net.ipv4.conf.all.accept_redirects = 0
+          net.ipv4.conf.all.secure_redirects = 0
+          net.ipv4.conf.all.accept_source_route = 0
+          net.ipv6.conf.all.accept_redirects = 0
+          net.ipv6.conf.default.accept_redirects = 0
+          EOF
+          
+          # Create SSH configuration
+          cat << 'EOF' > templates/sshd_config.j2
+          Port {{ ssh_port }}
+          Protocol 2
+          PermitRootLogin no
+          MaxAuthTries {{ '2' if security_level == 'fortress' else '3' if security_level == 'enhanced' else '5' }}
+          PubkeyAuthentication yes
+          PasswordAuthentication {{ 'no' if security_level == 'fortress' else 'no' if security_level == 'enhanced' else 'yes' }}
+          PermitEmptyPasswords no
+          X11Forwarding no
+          AllowTcpForwarding {{ 'no' if security_level == 'fortress' else 'yes' }}
+          ClientAliveInterval 300
+          ClientAliveCountMax 2
+          EOF
+
+      - name: Create security playbook
+        run: |
+          cat << 'EOF' > playbooks/security.yml
+          ---
+          - name: Security Configuration
+            hosts: localhost
+            become: yes
+            vars:
+              security_level: "{{ lookup('env', 'INPUT_SECURITY_LEVEL') }}"
+              ssh_port: "{{ lookup('env', 'INPUT_SSH_PORT') }}"
+              admin_email: "{{ lookup('env', 'INPUT_ADMIN_EMAIL') }}"
+              enable_monitoring: "{{ lookup('env', 'INPUT_ENABLE_MONITORING') | bool }}"
+              enable_notifications: "{{ lookup('env', 'INPUT_ENABLE_NOTIFICATIONS') | bool }}"
+            
+            tasks:
+              - name: System update
+                apt:
+                  update_cache: yes
+                  upgrade: dist
+                
+              - name: Install security packages
+                apt:
+                  name:
+                    - fail2ban
+                    - ufw
+                    - unattended-upgrades
+                    - rkhunter
+                    - chkrootkit
+                    - auditd
+                    - apparmor
+                    - apparmor-utils
+                    - aide
+                    - sendmail
+                  state: present
+                
+              - name: Configure fail2ban
+                template:
+                  src: fail2ban.conf.j2
+                  dest: /etc/fail2ban/jail.local
+                  mode: '0644'
+                notify: restart fail2ban
+                
+              - name: Configure SSH
+                template:
+                  src: sshd_config.j2
+                  dest: /etc/ssh/sshd_config
+                  mode: '0600'
+                notify: restart ssh
+                
+              - name: Configure UFW
+                ufw:
+                  rule: allow
+                  port: "{{ item }}"
+                  proto: tcp
+                loop:
+                  - "{{ ssh_port }}"
+                  - "80"
+                  - "443"
+                
+              - name: Enable UFW
+                ufw:
+                  state: enabled
+                  policy: deny
+                
+              - name: Configure system security
+                template:
+                  src: security.rules.j2
+                  dest: /etc/sysctl.d/90-security.conf
+                  mode: '0644'
+                notify: reload sysctl
+                
+              - name: Setup automatic updates
+                debconf:
+                  name: unattended-upgrades
+                  question: unattended-upgrades/enable_auto_updates
+                  value: "true"
+                  vtype: boolean
+                
+              - name: Configure AIDE
+                command: aide --init
+                args:
+                  creates: /var/lib/aide/aide.db.new
+                when: security_level == 'fortress'
+                
+              - name: Setup monitoring
+                when: enable_monitoring|bool
+                block:
+                  - name: Install monitoring tools
+                    apt:
+                      name:
+                        - prometheus-node-exporter
+                        - nagios-plugins
+                      state: present
+                      
+              - name: Configure email notifications
+                when: enable_notifications|bool
+                block:
+                  - name: Configure sendmail
+                    lineinfile:
+                      path: /etc/aliases
+                      line: "root: {{ admin_email }}"
+                      create: yes
+                    notify: update aliases
+                    
+              - name: Generate security report
+                copy:
+                  content: |
+                    Security Setup Report
+                    ====================
+                    Date: {{ ansible_date_time.iso8601 }}
+                    Security Level: {{ security_level }}
+                    SSH Port: {{ ssh_port }}
+                    Monitoring: {{ enable_monitoring }}
+                    Notifications: {{ enable_notifications }}
+                    
+                    Active Services:
+                    - UFW Status: {{ lookup('pipe', 'ufw status') }}
+                    - Fail2ban Status: {{ lookup('pipe', 'fail2ban-client status') }}
+                    {% if enable_monitoring %}
+                    - Monitoring Status: Active
+                    {% endif %}
+                  dest: security_report.txt
+                  mode: '0644'
+            
+            handlers:
+              - name: restart fail2ban
+                service:
+                  name: fail2ban
+                  state: restarted
+                
+              - name: restart ssh
+                service:
+                  name: sshd
+                  state: restarted
+                
+              - name: reload sysctl
+                command: sysctl --system
+                
+              - name: update aliases
+                command: newaliases
+          EOF
+
+      - name: Create inventory
+        run: |
+          mkdir -p inventory
+          echo "localhost ansible_connection=local" > inventory/hosts
+
+      - name: Run security playbook
+        env:
+          INPUT_SECURITY_LEVEL: ${{ github.event.inputs.security_level }}
+          INPUT_SSH_PORT: ${{ github.event.inputs.ssh_port }}
+          INPUT_ADMIN_EMAIL: ${{ github.event.inputs.admin_email }}
+          INPUT_ENABLE_MONITORING: ${{ github.event.inputs.enable_monitoring }}
+          INPUT_ENABLE_NOTIFICATIONS: ${{ github.event.inputs.enable_notifications }}
+        run: ansible-playbook -i inventory/hosts playbooks/security.yml -v
+
+      - name: Upload security report
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-report
+          path: security_report.txt
+          retention-days: 30
+
+      - name: Send notification
+        if: ${{ github.event.inputs.enable_notifications == 'true' }}
+        run: |
+          echo "🛡️ Security setup completed!" > notification.txt
+          echo "Security Level: ${{ github.event.inputs.security_level }}" >> notification.txt
+          echo "Check the security report for details." >> notification.txt
+          cat notification.txt

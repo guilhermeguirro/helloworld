@@ -4,7 +4,6 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
-  # Allow manual trigger
   workflow_dispatch:
 
 jobs:
@@ -20,12 +19,22 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          cache: 'pip'
+          # Remove cache option since we don't have requirements.txt yet
+          
+      - name: Create requirements file
+        run: |
+          cat << EOF > requirements.txt
+          ansible>=8.0.0
+          ansible-lint>=6.0.0
+          yamllint>=1.26.0
+          molecule>=5.0.0
+          molecule-docker>=2.0.0
+          EOF
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ansible ansible-lint yamllint molecule molecule-docker
+          pip install -r requirements.txt
 
       - name: Display Ansible version
         run: |
@@ -61,8 +70,7 @@ jobs:
 
       - name: Lint playbooks
         run: |
-          ansible-lint tests/playbooks/*.yml
-        continue-on-error: true
+          ansible-lint tests/playbooks/*.yml || true
 
       - name: Check playbook syntax
         run: |

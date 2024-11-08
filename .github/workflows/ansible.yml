@@ -1,0 +1,219 @@
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test-playbooks:
+    name: Test Ansible Playbooks
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ansible==8.5.0
+
+      - name: Create playbook directory
+        run: mkdir -p playbooks
+
+      - name: Create NGINX playbook
+        run: |
+          cat << 'EOF' > playbooks/nginx.yml
+          ---
+          - name: Install and Configure NGINX
+            hosts: localhost
+            become: yes
+            tasks:
+              - name: Install NGINX
+                apt:
+                  name: nginx
+                  state: present
+                  update_cache: yes
+
+              - name: Create custom index.html
+                copy:
+                  content: |
+                    <!DOCTYPE html>
+                    <html>
+                    <head><title>Welcome to NGINX!</title></head>
+                    <body>
+                      <h1>Hello from Ansible-configured NGINX!</h1>
+                      <p>If you see this, the playbook worked.</p>
+                    </body>
+                    </html>
+                  dest: /var/www/html/index.html
+
+              - name: Ensure NGINX is running
+                service:
+                  name: nginx
+                  state: started
+                  enabled: yes
+
+              - name: Check NGINX status
+                command: systemctl status nginx
+                register: nginx_status
+
+              - name: Display NGINX status
+                debug:
+                  var: nginx_status.stdout_lines
+          EOF
+
+      - name: Create Node.js playbook
+        run: |
+          cat << 'EOF' > playbooks/nodejs.yml
+          ---
+          - name: Install and Configure Node.js
+            hosts: localhost
+            become: yes
+            tasks:
+              - name: Install Node.js and npm
+                apt:
+                  name: 
+                    - nodejs
+                    - npm
+                  state: present
+                  update_cache: yes
+
+              - name: Check Node.js version
+                command: node --version
+                register: node_version
+
+              - name: Check npm version
+                command: npm --version
+                register: npm_version
+
+              - name: Display versions
+                debug:
+                  msg: 
+                    - "Node.js version: {{ node_version.stdout }}"
+                    - "npm version: {{ npm_version.stdout }}"
+          EOF
+
+      - name: Create Apache playbook
+        run: |
+          cat << 'EOF' > playbooks/apache.yml
+          ---
+          - name: Install and Configure Apache
+            hosts: localhost
+            become: yes
+            tasks:
+              - name: Install Apache
+                apt:
+                  name: apache2
+                  state: present
+                  update_cache: yes
+
+              - name: Create custom index.html
+                copy:
+                  content: |
+                    <!DOCTYPE html>
+                    <html>
+                    <head><title>Apache Test Page</title></head>
+                    <body>
+                      <h1>Hello from Ansible-configured Apache!</h1>
+                      <p>If you see this, the playbook worked.</p>
+                    </body>
+                    </html>
+                  dest: /var/www/html/index.html
+
+              - name: Ensure Apache is running
+                service:
+                  name: apache2
+                  state: started
+                  enabled: yes
+          EOF
+
+      - name: Create MySQL playbook
+        run: |
+          cat << 'EOF' > playbooks/mysql.yml
+          ---
+          - name: Install and Configure MySQL
+            hosts: localhost
+            become: yes
+            tasks:
+              - name: Install MySQL
+                apt:
+                  name: 
+                    - mysql-server
+                    - python3-pymysql
+                  state: present
+                  update_cache: yes
+
+              - name: Ensure MySQL is running
+                service:
+                  name: mysql
+                  state: started
+                  enabled: yes
+
+              - name: Check MySQL version
+                command: mysql --version
+                register: mysql_version
+
+              - name: Display MySQL version
+                debug:
+                  var: mysql_version.stdout
+          EOF
+
+      - name: Create Redis playbook
+        run: |
+          cat << 'EOF' > playbooks/redis.yml
+          ---
+          - name: Install and Configure Redis
+            hosts: localhost
+            become: yes
+            tasks:
+              - name: Install Redis
+                apt:
+                  name: redis-server
+                  state: present
+                  update_cache: yes
+
+              - name: Ensure Redis is running
+                service:
+                  name: redis-server
+                  state: started
+                  enabled: yes
+
+              - name: Check Redis status
+                command: systemctl status redis-server
+                register: redis_status
+
+              - name: Display Redis status
+                debug:
+                  var: redis_status.stdout_lines
+          EOF
+
+      - name: Create inventory
+        run: |
+          mkdir -p inventory
+          echo "localhost ansible_connection=local" > inventory/hosts
+
+      - name: Check playbook syntax
+        run: |
+          for playbook in playbooks/*.yml; do
+            echo "Checking syntax for $playbook"
+            ansible-playbook "$playbook" --syntax-check
+          done
+
+      - name: Run NGINX playbook
+        run: ansible-playbook -i inventory/hosts playbooks/nginx.yml
+
+      - name: Run Node.js playbook
+        run: ansible-playbook -i inventory/hosts playbooks/nodejs.yml
+
+      - name: Run MySQL playbook
+        run: ansible-playbook -i inventory/hosts playbooks/mysql.yml
+
+      - name: Run Redis playbook
+        run: ansible-playbook -i inventory/hosts playbooks/redis.yml

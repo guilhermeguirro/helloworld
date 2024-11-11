@@ -1,0 +1,291 @@
+name: 🚀 Interactive AWS Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      server_role:
+        description: '🎯 Server Role'
+        required: true
+        type: choice
+        options:
+          - '🌐 Web Server'
+          - '⚡ Application Server'
+          - '🗄️ Database Server'
+          - '📊 Monitoring Server'
+      
+      instance_type:
+        description: '💻 Instance Size'
+        required: true
+        type: choice
+        options:
+          - 't2.micro (1 CPU, 1GB RAM)'
+          - 't2.small (1 CPU, 2GB RAM)'
+          - 't2.medium (2 CPU, 4GB RAM)'
+      
+      server_name:
+        description: '🏷️ Server Name'
+        required: true
+        default: 'test-server'
+        type: string
+      
+      software_stack:
+        description: '📚 Software Stack'
+        required: true
+        type: choice
+        options:
+          - '🔵 NGINX + Node.js'
+          - '🟢 Apache + PHP'
+          - '🟣 NGINX + Python'
+          - '🔴 NGINX + Ruby'
+      
+      security_level:
+        description: '🔒 Security Level'
+        required: true
+        type: choice
+        options:
+          - '🟢 Basic (SSH + HTTP/HTTPS)'
+          - '🟡 Standard (+ Custom Ports)'
+          - '🔴 Strict (IP Restricted)'
+      
+      install_monitoring:
+        description: '📊 Install Monitoring Tools?'
+        required: true
+        type: boolean
+        default: true
+
+env:
+  AWS_REGION: us-east-1
+  UBUNTU_AMI: ami-0c7217cdde317cfec
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    outputs:
+      instance_ip: ${{ steps.create-ec2.outputs.public_ip }}
+      instance_id: ${{ steps.create-ec2.outputs.instance_id }}
+    
+    steps:
+      - name: Display Banner
+        run: |
+          echo "🚀 Starting Interactive AWS Deployment"
+          echo "==============================="
+          echo "Role: ${{ inputs.server_role }}"
+          echo "Stack: ${{ inputs.software_stack }}"
+          echo "Security: ${{ inputs.security_level }}"
+          echo "==============================="
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Create Security Group
+        id: create-sg
+        run: |
+          echo "🛡️ Creating security group..."
+          
+          SG_ID=$(aws ec2 create-security-group \
+            --group-name "${{ inputs.server_name }}-sg-${{ github.run_number }}" \
+            --description "Security group for ${{ inputs.server_name }}" \
+            --output text)
+          
+          echo "sg_id=$SG_ID" >> $GITHUB_OUTPUT
+          
+          # Basic security rules
+          echo "🔒 Configuring basic security rules..."
+          aws ec2 authorize-security-group-ingress \
+            --group-id $SG_ID \
+            --protocol tcp \
+            --port 22 \
+            --cidr 0.0.0.0/0
+          
+          aws ec2 authorize-security-group-ingress \
+            --group-id $SG_ID \
+            --protocol tcp \
+            --port 80 \
+            --cidr 0.0.0.0/0
+          
+          aws ec2 authorize-security-group-ingress \
+            --group-id $SG_ID \
+            --protocol tcp \
+            --port 443 \
+            --cidr 0.0.0.0/0
+          
+          # Additional ports based on security level
+          if [[ "${{ inputs.security_level }}" != "🟢 Basic (SSH + HTTP/HTTPS)" ]]; then
+            echo "🔒 Adding additional security rules..."
+            # Add monitoring ports
+            aws ec2 authorize-security-group-ingress \
+              --group-id $SG_ID \
+              --protocol tcp \
+              --port 9090 \
+              --cidr 0.0.0.0/0
+            
+            aws ec2 authorize-security-group-ingress \
+              --group-id $SG_ID \
+              --protocol tcp \
+              --port 3000 \
+              --cidr 0.0.0.0/0
+          fi
+
+      - name: Create Key Pair
+        id: create-key
+        run: |
+          echo "🔑 Creating key pair..."
+          KEY_NAME="${{ inputs.server_name }}-key-${{ github.run_number }}"
+          aws ec2 create-key-pair \
+            --key-name "$KEY_NAME" \
+            --query 'KeyMaterial' \
+            --output text > key.pem
+          
+          chmod 600 key.pem
+          echo "key_name=$KEY_NAME" >> $GITHUB_OUTPUT
+          echo "✅ Key pair created successfully"
+
+      - name: Launch EC2 Instance
+        id: create-ec2
+        run: |
+          echo "🚀 Launching EC2 instance..."
+          
+          # Extract instance type
+          INSTANCE_TYPE=$(echo "${{ inputs.instance_type }}" | cut -d' ' -f1)
+          
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id ${{ env.UBUNTU_AMI }} \
+            --instance-type $INSTANCE_TYPE \
+            --key-name ${{ steps.create-key.outputs.key_name }} \
+            --security-group-ids ${{ steps.create-sg.outputs.sg_id }} \
+            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${{ inputs.server_name }}},{Key=Role,Value=${{ inputs.server_role }}}]" \
+            --query 'Instances[0].InstanceId' \
+            --output text)
+          
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+          
+          echo "⏳ Waiting for instance to be running..."
+          aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+          
+          PUBLIC_IP=$(aws ec2 describe-instances \
+            --instance-ids $INSTANCE_ID \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)
+          
+          echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
+          echo "✅ Instance launched successfully at $PUBLIC_IP"
+
+      - name: Wait for Instance
+        run: |
+          echo "⏳ Waiting for instance to be ready..."
+          sleep 60
+
+      - name: Install Software Stack
+        run: |
+          echo "📦 Installing selected software stack..."
+          
+          ssh -i key.pem -o StrictHostKeyChecking=no ubuntu@${{ steps.create-ec2.outputs.public_ip }} '
+            sudo apt-get update
+            sudo apt-get install -y curl wget git
+            
+            case "${{ inputs.software_stack }}" in
+              "🔵 NGINX + Node.js")
+                echo "Installing NGINX and Node.js..."
+                sudo apt-get install -y nginx
+                curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+                sudo apt-get install -y nodejs
+                ;;
+                
+              "🟢 Apache + PHP")
+                echo "Installing Apache and PHP..."
+                sudo apt-get install -y apache2 php libapache2-mod-php php-mysql
+                ;;
+                
+              "🟣 NGINX + Python")
+                echo "Installing NGINX and Python..."
+                sudo apt-get install -y nginx python3 python3-pip
+                sudo pip3 install flask gunicorn
+                ;;
+                
+              "🔴 NGINX + Ruby")
+                echo "Installing NGINX and Ruby..."
+                sudo apt-get install -y nginx ruby ruby-dev
+                sudo gem install bundler
+                ;;
+            esac
+            
+            if [ "${{ inputs.install_monitoring }}" = "true" ]; then
+              echo "Installing monitoring tools..."
+              sudo apt-get install -y prometheus node-exporter
+            fi
+            
+            # Create test page
+            echo "<h1>Server Setup Complete!</h1>" | sudo tee /var/www/html/index.html
+            echo "<p>Role: ${{ inputs.server_role }}</p>" | sudo tee -a /var/www/html/index.html
+            echo "<p>Stack: ${{ inputs.software_stack }}</p>" | sudo tee -a /var/www/html/index.html
+          '
+
+      - name: Verify Installation
+        id: verify
+        run: |
+          echo "🔍 Verifying installation..."
+          
+          # Check web server
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://${{ steps.create-ec2.outputs.public_ip }})
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✅ Web server is running"
+          else
+            echo "⚠️ Web server check failed"
+          fi
+          
+          # Check monitoring if enabled
+          if [ "${{ inputs.install_monitoring }}" = "true" ]; then
+            METRICS_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://${{ steps.create-ec2.outputs.public_ip }}:9100/metrics)
+            if [ "$METRICS_CODE" = "200" ]; then
+              echo "✅ Monitoring is running"
+            else
+              echo "⚠️ Monitoring check failed"
+            fi
+          fi
+
+      - name: Generate Report
+        run: |
+          cat << EOF > report.md
+          # 🚀 Deployment Report
+          
+          ## Server Information
+          - 🏷️ Name: ${{ inputs.server_name }}
+          - 🎯 Role: ${{ inputs.server_role }}
+          - 💻 Type: ${{ inputs.instance_type }}
+          - 🌐 IP: ${{ steps.create-ec2.outputs.public_ip }}
+          
+          ## Software Stack
+          - 📚 Stack: ${{ inputs.software_stack }}
+          - 📊 Monitoring: ${{ inputs.install_monitoring }}
+          
+          ## Security
+          - 🔒 Level: ${{ inputs.security_level }}
+          - 🔑 Key: ${{ steps.create-key.outputs.key_name }}
+          
+          ## Access URLs
+          - Website: http://${{ steps.create-ec2.outputs.public_ip }}
+          - Monitoring: http://${{ steps.create-ec2.outputs.public_ip }}:9090
+          EOF
+
+      - name: Upload Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-report
+          path: report.md
+          retention-days: 1
+
+      - name: Display Summary
+        run: |
+          echo "✅ Deployment Complete!"
+          echo "========================"
+          echo "🌐 Access your server:"
+          echo "Website: http://${{ steps.create-ec2.outputs.public_ip }}"
+          if [ "${{ inputs.install_monitoring }}" = "true" ]; then
+            echo "Monitoring: http://${{ steps.create-ec2.outputs.public_ip }}:9090"
+          fi
+          echo "========================"
+          echo "📝 Full report available in the artifacts section"

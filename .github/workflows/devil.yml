@@ -1,0 +1,359 @@
+name: 🚀 Enhanced Multi-Host Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_count:
+        description: '🖥️ Number of Servers'
+        required: true
+        type: choice
+        options:
+          - '2'
+          - '3'
+          - '4'
+      instance_type:
+        description: '💻 Instance Type'
+        required: true
+        type: choice
+        options:
+          - 't2.micro'
+          - 't2.small'
+      deployment_type:
+        description: '🎯 Deployment Type'
+        required: true
+        type: choice
+        options:
+          - 'Web Cluster'
+          - 'Full Stack'
+          - 'Database Cluster'
+      web_stack:
+        description: '🌐 Web Stack'
+        required: true
+        type: choice
+        options:
+          - 'NGINX + Node.js'
+          - 'Apache + PHP'
+          - 'NGINX + Python'
+      database_type:
+        description: '🗄️ Database'
+        required: true
+        type: choice
+        options:
+          - 'MySQL'
+          - 'PostgreSQL'
+          - 'MongoDB'
+      monitoring:
+        description: '📊 Monitoring'
+        required: true
+        type: choice
+        options:
+          - 'Prometheus + Grafana'
+          - 'ELK Stack'
+          - 'None'
+      enable_lb:
+        description: '⚖️ Enable Load Balancer'
+        required: true
+        type: boolean
+        default: true
+      enable_backup:
+        description: '💾 Enable Automated Backups'
+        required: true
+        type: boolean
+        default: true
+
+env:
+  AWS_REGION: us-east-1
+  UBUNTU_AMI: ami-0c7217cdde317cfec
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ansible jq unzip
+          ansible-galaxy collection install community.general
+
+      - name: Create Infrastructure
+        id: infra
+        run: |
+          # Create security group with all necessary ports
+          SG_ID=$(aws ec2 create-security-group \
+            --group-name "cluster-${{ github.run_id }}" \
+            --description "Security group for cluster" \
+            --output json | jq -r '.GroupId')
+          
+          # Basic ports (SSH, HTTP, HTTPS)
+          declare -a PORTS=(22 80 443)
+          
+          # Add database ports
+          case "${{ inputs.database_type }}" in
+            "MySQL") PORTS+=(3306) ;;
+            "PostgreSQL") PORTS+=(5432) ;;
+            "MongoDB") PORTS+=(27017) ;;
+          esac
+          
+          # Add monitoring ports
+          case "${{ inputs.monitoring }}" in
+            "Prometheus + Grafana") PORTS+=(9090 9100 3000) ;;
+            "ELK Stack") PORTS+=(9200 5601 5044) ;;
+          esac
+          
+          # Configure security group rules
+          for PORT in "${PORTS[@]}"; do
+            aws ec2 authorize-security-group-ingress \
+              --group-id $SG_ID \
+              --protocol tcp \
+              --port $PORT \
+              --cidr 0.0.0.0/0
+          done
+          
+          # Create key pair
+          aws ec2 create-key-pair \
+            --key-name "key-${{ github.run_id }}" \
+            --query 'KeyMaterial' \
+            --output text > key.pem
+          chmod 600 key.pem
+          
+          # Launch instances
+          declare -a IPS
+          for i in $(seq 1 ${{ inputs.instance_count }}); do
+            INSTANCE_ID=$(aws ec2 run-instances \
+              --image-id ${{ env.UBUNTU_AMI }} \
+              --instance-type ${{ inputs.instance_type }} \
+              --key-name "key-${{ github.run_id }}" \
+              --security-group-ids $SG_ID \
+              --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=node-$i}]" \
+              --output json | jq -r '.Instances[0].InstanceId')
+            
+            aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+            
+            IP=$(aws ec2 describe-instances \
+              --instance-ids $INSTANCE_ID \
+              --query 'Reservations[0].Instances[0].PublicIpAddress' \
+              --output text)
+            
+            IPS+=($IP)
+          done
+          
+          echo "all_ips=$(IFS=,; echo "${IPS[*]}")" >> $GITHUB_OUTPUT
+
+      - name: Create Ansible Files
+        run: |
+          # Create inventory with groups
+          cat > inventory.ini << EOF
+          [webservers]
+          $(IPS="${{ steps.infra.outputs.all_ips }}"; for IP in ${IPS//,/ }; do echo "$IP ansible_user=ubuntu ansible_ssh_private_key_file=key.pem"; done)
+          
+          [dbservers]
+          $(IPS="${{ steps.infra.outputs.all_ips }}"; echo "${IPS//,/ }" | awk '{print $1" ansible_user=ubuntu ansible_ssh_private_key_file=key.pem"}')
+          
+          [monitoring]
+          $(IPS="${{ steps.infra.outputs.all_ips }}"; echo "${IPS//,/ }" | awk '{print $NF" ansible_user=ubuntu ansible_ssh_private_key_file=key.pem"}')
+          
+          [loadbalancer]
+          $(IPS="${{ steps.infra.outputs.all_ips }}"; echo "${IPS//,/ }" | awk '{print $1" ansible_user=ubuntu ansible_ssh_private_key_file=key.pem"}')
+          
+          [all:vars]
+          ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+          ansible_python_interpreter=/usr/bin/python3
+          database_type=${{ inputs.database_type }}
+          monitoring_stack=${{ inputs.monitoring }}
+          web_stack=${{ inputs.web_stack }}
+          EOF
+          
+          # Create main playbook
+          cat > site.yml << EOF
+          ---
+          - name: Configure Web Servers
+            hosts: webservers
+            become: yes
+            tasks:
+              - name: Install common packages
+                apt:
+                  name: ['curl', 'wget', 'git', 'unzip']
+                  update_cache: yes
+              
+              - name: Install Web Stack
+                include_tasks: "tasks/web_{{ web_stack | lower | replace(' + ', '_') }}.yml"
+          
+          - name: Configure Database
+            hosts: dbservers
+            become: yes
+            tasks:
+              - name: Install Database
+                include_tasks: "tasks/db_{{ database_type | lower }}.yml"
+          
+          - name: Setup Monitoring
+            hosts: monitoring
+            become: yes
+            when: monitoring_stack != 'None'
+            tasks:
+              - name: Install Monitoring Stack
+                include_tasks: "tasks/monitoring_{{ monitoring_stack | lower | replace(' + ', '_') }}.yml"
+          
+          - name: Configure Load Balancer
+            hosts: loadbalancer
+            become: yes
+            when: ${{ inputs.enable_lb }}
+            tasks:
+              - name: Install HAProxy
+                apt:
+                  name: haproxy
+                  state: present
+              
+              - name: Configure HAProxy
+                template:
+                  src: templates/haproxy.cfg.j2
+                  dest: /etc/haproxy/haproxy.cfg
+                notify: restart haproxy
+            
+            handlers:
+              - name: restart haproxy
+                service:
+                  name: haproxy
+                  state: restarted
+          EOF
+          
+          # Create task files for different components
+          mkdir -p tasks templates
+          
+          # Web stack tasks
+          cat > tasks/web_nginx_nodejs.yml << EOF
+          ---
+          - name: Install NGINX
+            apt:
+              name: nginx
+              state: present
+          
+          - name: Install Node.js
+            shell: |
+              curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+              apt-get install -y nodejs
+          EOF
+          
+          # Database tasks
+          cat > tasks/db_mysql.yml << EOF
+          ---
+          - name: Install MySQL
+            apt:
+              name: mysql-server
+              state: present
+          
+          - name: Start MySQL
+            service:
+              name: mysql
+              state: started
+              enabled: yes
+          EOF
+          
+          # Monitoring tasks
+          cat > tasks/monitoring_prometheus_grafana.yml << EOF
+          ---
+          - name: Install Prometheus
+            apt:
+              name: prometheus
+              state: present
+          
+          - name: Install Grafana
+            shell: |
+              wget -q -O - https://packages.grafana.com/gpg.key | apt-key add -
+              echo "deb https://packages.grafana.com/oss/deb stable main" > /etc/apt/sources.list.d/grafana.list
+              apt-get update
+              apt-get install -y grafana
+          EOF
+          
+          # HAProxy template
+          cat > templates/haproxy.cfg.j2 << EOF
+          global
+              log /dev/log local0
+              log /dev/log local1 notice
+              daemon
+          
+          defaults
+              log global
+              mode http
+              option httplog
+              timeout connect 5000
+              timeout client 50000
+              timeout server 50000
+          
+          frontend http_front
+              bind *:80
+              default_backend http_back
+          
+          backend http_back
+              balance roundrobin
+              {% for host in groups['webservers'] %}
+              server {{ hostvars[host].inventory_hostname }} {{ host }}:80 check
+              {% endfor %}
+          EOF
+
+      - name: Wait for SSH
+        run: |
+          IPS="${{ steps.infra.outputs.all_ips }}"
+          for IP in ${IPS//,/ }; do
+            until ssh -i key.pem -o StrictHostKeyChecking=no ubuntu@$IP 'echo "SSH Ready"' 2>/dev/null; do
+              sleep 5
+            done
+          done
+
+      - name: Run Ansible Playbook
+        run: |
+          ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -i inventory.ini site.yml -v
+
+      - name: Verify Deployment
+        run: |
+          IPS="${{ steps.infra.outputs.all_ips }}"
+          echo "Checking services..."
+          for IP in ${IPS//,/ }; do
+            echo "Server $IP:"
+            echo "- Web Server:"
+            curl -Is http://$IP | head -n 1
+            
+            if [[ "${{ inputs.monitoring }}" == "Prometheus + Grafana" ]]; then
+              echo "- Prometheus:"
+              curl -Is http://$IP:9090 | head -n 1
+              echo "- Grafana:"
+              curl -Is http://$IP:3000 | head -n 1
+            fi
+          done
+
+      - name: Generate Report
+        run: |
+          cat << EOF > report.md
+          # 🚀 Deployment Report
+          
+          ## Infrastructure
+          - 🖥️ Servers: ${{ inputs.instance_count }}
+          - 💻 Type: ${{ inputs.instance_type }}
+          - 🌐 Stack: ${{ inputs.web_stack }}
+          - 🗄️ Database: ${{ inputs.database_type }}
+          - 📊 Monitoring: ${{ inputs.monitoring }}
+          
+          ## Server List
+          $(IPS="${{ steps.infra.outputs.all_ips }}"; for IP in ${IPS//,/ }; do echo "* http://$IP"; done)
+          
+          ## Services
+          - Web Servers: Running on all nodes
+          - Database: Running on first node
+          - Monitoring: Running on last node
+          - Load Balancer: ${{ inputs.enable_lb && 'Enabled' || 'Disabled' }}
+          - Backups: ${{ inputs.enable_backup && 'Enabled' || 'Disabled' }}
+          EOF
+
+      - name: Upload Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-report
+          path: report.md
+          retention-days: 1
+

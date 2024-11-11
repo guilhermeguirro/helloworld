@@ -1,0 +1,228 @@
+name: 🚀 AWS Infrastructure Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_count:
+        description: '🖥️ How many servers?'
+        required: true
+        type: choice
+        options: ['2', '3']
+        default: '2'
+      instance_type:
+        description: '💻 Server Size'
+        required: true
+        type: choice
+        options:
+          - 't2.micro'
+          - 't2.small'
+        default: 't2.micro'
+      web_stack:
+        description: '🌐 Web Stack'
+        required: true
+        type: choice
+        options:
+          - 'NGINX + Node.js'
+          - 'Apache + PHP'
+        default: 'NGINX + Node.js'
+      database:
+        description: '🗄️ Database'
+        required: true
+        type: choice
+        options:
+          - 'MySQL'
+          - 'PostgreSQL'
+          - 'None'
+        default: 'MySQL'
+
+env:
+  AWS_REGION: us-east-1
+  UBUNTU_AMI: ami-0c7217cdde317cfec
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ansible jq
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create Security Group
+        id: sg
+        run: |
+          SG_ID=$(aws ec2 create-security-group \
+            --group-name "sg-${{ github.run_id }}" \
+            --description "Security group for deployment" \
+            --output json | jq -r '.GroupId')
+          
+          aws ec2 authorize-security-group-ingress \
+            --group-id $SG_ID \
+            --ip-permissions '[
+              {"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+              {"IpProtocol": "tcp", "FromPort": 80, "ToPort": 80, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+              {"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+              {"IpProtocol": "tcp", "FromPort": 3306, "ToPort": 3306, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}
+            ]'
+          
+          echo "sg_id=$SG_ID" >> $GITHUB_OUTPUT
+
+      - name: Create Key Pair
+        id: key
+        run: |
+          KEY_NAME="key-${{ github.run_id }}"
+          aws ec2 create-key-pair \
+            --key-name "$KEY_NAME" \
+            --query 'KeyMaterial' \
+            --output text > key.pem
+          chmod 600 key.pem
+          echo "key_name=$KEY_NAME" >> $GITHUB_OUTPUT
+
+      - name: Launch EC2
+        id: ec2
+        run: |
+          declare -a INSTANCE_IPS=()
+          
+          for i in $(seq 1 ${{ inputs.instance_count }}); do
+            INSTANCE_ID=$(aws ec2 run-instances \
+              --image-id ${{ env.UBUNTU_AMI }} \
+              --instance-type ${{ inputs.instance_type }} \
+              --key-name ${{ steps.key.outputs.key_name }} \
+              --security-group-ids ${{ steps.sg.outputs.sg_id }} \
+              --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=server-$i}]" \
+              --output json | jq -r '.Instances[0].InstanceId')
+            
+            aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+            
+            IP=$(aws ec2 describe-instances \
+              --instance-ids $INSTANCE_ID \
+              --query 'Reservations[0].Instances[0].PublicIpAddress' \
+              --output text)
+            
+            INSTANCE_IPS+=($IP)
+          done
+          
+          echo "all_ips=${INSTANCE_IPS[*]}" >> $GITHUB_OUTPUT
+
+      - name: Setup Ansible
+        run: |
+          # Create inventory
+          cat > inventory.ini << EOF
+          [webservers]
+          $(IFS=' ' read -ra IPS <<< "${{ steps.ec2.outputs.all_ips }}"; for IP in "${IPS[@]}"; do echo "$IP ansible_user=ubuntu ansible_ssh_private_key_file=key.pem"; done)
+          
+          [dbservers]
+          $(IFS=' ' read -ra IPS <<< "${{ steps.ec2.outputs.all_ips }}"; echo "${IPS[0]} ansible_user=ubuntu ansible_ssh_private_key_file=key.pem")
+          
+          [all:vars]
+          ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+          ansible_python_interpreter=/usr/bin/python3
+          EOF
+          
+          # Create playbook
+          cat > playbook.yml << EOF
+          ---
+          - hosts: all
+            become: yes
+            tasks:
+              - name: Update apt
+                apt:
+                  update_cache: yes
+                  
+              - name: Install common packages
+                apt:
+                  name:
+                    - curl
+                    - git
+                    - vim
+                  state: present
+          
+          - hosts: webservers
+            become: yes
+            tasks:
+              - name: Install NGINX
+                apt:
+                  name: nginx
+                  state: present
+                when: "'NGINX' in '${{ inputs.web_stack }}'"
+              
+              - name: Install Node.js
+                shell: |
+                  curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+                  apt-get install -y nodejs
+                when: "'Node.js' in '${{ inputs.web_stack }}'"
+              
+              - name: Install Apache & PHP
+                apt:
+                  name:
+                    - apache2
+                    - php
+                    - php-mysql
+                  state: present
+                when: "'Apache' in '${{ inputs.web_stack }}'"
+          
+          - hosts: dbservers
+            become: yes
+            tasks:
+              - name: Install MySQL
+                apt:
+                  name: mysql-server
+                  state: present
+                when: "'MySQL' in '${{ inputs.database }}'"
+              
+              - name: Install PostgreSQL
+                apt:
+                  name: postgresql
+                  state: present
+                when: "'PostgreSQL' in '${{ inputs.database }}'"
+          EOF
+
+      - name: Wait for SSH
+        run: |
+          for IP in ${{ steps.ec2.outputs.all_ips }}; do
+            until ssh -i key.pem -o StrictHostKeyChecking=no ubuntu@$IP 'echo "SSH Ready"' 2>/dev/null; do
+              sleep 5
+            done
+          done
+
+      - name: Run Ansible
+        run: |
+          ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -i inventory.ini playbook.yml -v
+
+      - name: Create Report
+        run: |
+          {
+            echo "# 🚀 Deployment Report"
+            echo
+            echo "## Servers"
+            for IP in ${{ steps.ec2.outputs.all_ips }}; do
+              echo "- 🌐 http://$IP"
+            done
+            echo
+            echo "## Configuration"
+            echo "- Instance Type: ${{ inputs.instance_type }}"
+            echo "- Web Stack: ${{ inputs.web_stack }}"
+            echo "- Database: ${{ inputs.database }}"
+            echo
+            echo "## Access"
+            echo "\`\`\`bash"
+            echo "# SSH Access:"
+            echo "ssh -i key.pem ubuntu@SERVER_IP"
+            echo "\`\`\`"
+          } > report.md
+
+      - name: Upload Info
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-info
+          path: |
+            key.pem
+            report.md
+          retention-days: 1

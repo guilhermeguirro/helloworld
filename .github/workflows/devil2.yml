@@ -1,0 +1,512 @@
+name: 🚀 Complete Infrastructure Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      # Basic Configuration
+      instance_count:
+        description: '🖥️ Number of Servers'
+        required: true
+        type: choice
+        options: ['2', '3', '4', '5']
+      instance_type:
+        description: '💻 Instance Type (e.g., t2.micro)'
+        required: true
+        type: string
+        default: 't2.micro'
+      deployment_type:
+        description: '🎯 Deployment Type'
+        required: true
+        type: choice
+        options:
+          - 'Full Stack (Web + DB + Monitoring)'
+          - 'Web Server Only'
+          - 'Database Cluster'
+          - 'Monitoring Stack'
+
+      # Stack Selection
+      web_stack:
+        description: '🌐 Web Stack'
+        required: true
+        type: choice
+        options:
+          - 'NGINX + Node.js'
+          - 'Apache + PHP'
+          - 'NGINX + Python'
+          - 'Custom'
+      database_type:
+        description: '🗄️ Database'
+        required: true
+        type: choice
+        options:
+          - 'MySQL'
+          - 'PostgreSQL'
+          - 'MongoDB'
+          - 'None'
+      monitoring:
+        description: '📊 Monitoring'
+        required: true
+        type: choice
+        options:
+          - 'Prometheus + Grafana'
+          - 'None'
+
+      # Advanced Options
+      custom_packages:
+        description: '📦 Additional Packages (comma-separated)'
+        required: false
+        type: string
+        default: 'git,vim,curl'
+      custom_ports:
+        description: '🔌 Extra Ports (comma-separated)'
+        required: false
+        type: string
+        default: '8080,8443,3000'
+      custom_domain:
+        description: '🌐 Domain Name (optional)'
+        required: false
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+  UBUNTU_AMI: ami-0c7217cdde317cfec
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Required Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ansible jq
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create Security Group
+        id: securitygroup
+        run: |
+          echo "Creating security group..."
+          SG_ID=$(aws ec2 create-security-group \
+            --group-name "stack-${{ github.run_id }}" \
+            --description "Security group for full stack deployment" \
+            --output json | jq -r '.GroupId')
+          
+          echo "Configuring basic security rules..."
+          # SSH, HTTP, HTTPS
+          aws ec2 authorize-security-group-ingress \
+            --group-id $SG_ID \
+            --ip-permissions '[
+              {"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+              {"IpProtocol": "tcp", "FromPort": 80, "ToPort": 80, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+              {"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}
+            ]'
+          
+          # Database ports
+          if [[ "${{ inputs.database_type }}" == "MySQL" ]]; then
+            aws ec2 authorize-security-group-ingress \
+              --group-id $SG_ID \
+              --protocol tcp \
+              --port 3306 \
+              --cidr 0.0.0.0/0
+          elif [[ "${{ inputs.database_type }}" == "PostgreSQL" ]]; then
+            aws ec2 authorize-security-group-ingress \
+              --group-id $SG_ID \
+              --protocol tcp \
+              --port 5432 \
+              --cidr 0.0.0.0/0
+          elif [[ "${{ inputs.database_type }}" == "MongoDB" ]]; then
+            aws ec2 authorize-security-group-ingress \
+              --group-id $SG_ID \
+              --protocol tcp \
+              --port 27017 \
+              --cidr 0.0.0.0/0
+          fi
+          
+          # Monitoring ports
+          if [[ "${{ inputs.monitoring }}" == "Prometheus + Grafana" ]]; then
+            aws ec2 authorize-security-group-ingress \
+              --group-id $SG_ID \
+              --ip-permissions '[
+                {"IpProtocol": "tcp", "FromPort": 9090, "ToPort": 9090, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+                {"IpProtocol": "tcp", "FromPort": 9100, "ToPort": 9100, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+                {"IpProtocol": "tcp", "FromPort": 3000, "ToPort": 3000, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}
+              ]'
+          fi
+          
+          # Custom ports
+          if [[ -n "${{ inputs.custom_ports }}" ]]; then
+            IFS=',' read -ra PORTS <<< "${{ inputs.custom_ports }}"
+            for PORT in "${PORTS[@]}"; do
+              aws ec2 authorize-security-group-ingress \
+                --group-id $SG_ID \
+                --protocol tcp \
+                --port $PORT \
+                --cidr 0.0.0.0/0
+            done
+          fi
+          
+          echo "sg_id=$SG_ID" >> $GITHUB_OUTPUT
+
+      - name: Create Key Pair
+        id: keypair
+        run: |
+          echo "Creating key pair..."
+          KEY_NAME="key-${{ github.run_id }}"
+          aws ec2 create-key-pair \
+            --key-name "$KEY_NAME" \
+            --query 'KeyMaterial' \
+            --output text > key.pem
+          chmod 600 key.pem
+          echo "key_name=$KEY_NAME" >> $GITHUB_OUTPUT
+
+      - name: Launch EC2 Instances
+        id: instances
+        run: |
+          echo "Launching EC2 instances..."
+          declare -a INSTANCE_IPS=()
+          
+          for i in $(seq 1 ${{ inputs.instance_count }}); do
+            echo "Launching instance $i..."
+            
+            INSTANCE_ID=$(aws ec2 run-instances \
+              --image-id ${{ env.UBUNTU_AMI }} \
+              --instance-type ${{ inputs.instance_type }} \
+              --key-name ${{ steps.keypair.outputs.key_name }} \
+              --security-group-ids ${{ steps.securitygroup.outputs.sg_id }} \
+              --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=server-$i}]" \
+              --output json | jq -r '.Instances[0].InstanceId')
+            
+            echo "Waiting for instance $INSTANCE_ID..."
+            aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+            
+            IP=$(aws ec2 describe-instances \
+              --instance-ids $INSTANCE_ID \
+              --query 'Reservations[0].Instances[0].PublicIpAddress' \
+              --output text)
+            
+            INSTANCE_IPS+=($IP)
+            echo "Instance $i IP: $IP"
+          done
+          
+          echo "all_ips=${INSTANCE_IPS[*]}" >> $GITHUB_OUTPUT
+
+          - name: Create Ansible Configuration
+        id: ansible-config
+        run: |
+          echo "Creating Ansible files..."
+          
+          # Create inventory with all groups
+          cat > inventory.ini << EOF
+          [webservers]
+          $(IFS=' ' read -ra IPS <<< "${{ steps.instances.outputs.all_ips }}"; for IP in "${IPS[@]}"; do echo "$IP ansible_user=ubuntu ansible_ssh_private_key_file=key.pem"; done)
+          
+          [dbservers]
+          $(IFS=' ' read -ra IPS <<< "${{ steps.instances.outputs.all_ips }}"; echo "${IPS[0]} ansible_user=ubuntu ansible_ssh_private_key_file=key.pem")
+          
+          [monitoring]
+          $(IFS=' ' read -ra IPS <<< "${{ steps.instances.outputs.all_ips }}"; echo "${IPS[-1]} ansible_user=ubuntu ansible_ssh_private_key_file=key.pem")
+          
+          [all:vars]
+          ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+          ansible_python_interpreter=/usr/bin/python3
+          web_stack=${{ inputs.web_stack }}
+          database_type=${{ inputs.database_type }}
+          monitoring_stack=${{ inputs.monitoring }}
+          EOF
+          
+          # Create main playbook
+          cat > playbook.yml << EOF
+          ---
+          - name: Base Configuration
+            hosts: all
+            become: yes
+            tasks:
+              - name: Update apt cache
+                apt:
+                  update_cache: yes
+                  cache_valid_time: 3600
+              
+              - name: Install basic packages
+                apt:
+                  name: "{{ item }}"
+                  state: present
+                loop: $(echo "${{ inputs.custom_packages }}" | tr ',' '\n' | jq -R -s -c 'split("\n")[:-1]')
+          
+          - name: Configure Web Servers
+            hosts: webservers
+            become: yes
+            tasks:
+              - name: Install NGINX
+                apt:
+                  name: nginx
+                  state: present
+                when: "'NGINX' in web_stack"
+              
+              - name: Install Apache
+                apt:
+                  name: apache2
+                  state: present
+                when: "'Apache' in web_stack"
+              
+              - name: Install Node.js
+                shell: |
+                  curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+                  apt-get install -y nodejs
+                when: "'Node.js' in web_stack"
+              
+              - name: Install PHP
+                apt:
+                  name: 
+                    - php
+                    - php-fpm
+                    - php-mysql
+                  state: present
+                when: "'PHP' in web_stack"
+              
+              - name: Install Python packages
+                apt:
+                  name:
+                    - python3
+                    - python3-pip
+                    - python3-venv
+                  state: present
+                when: "'Python' in web_stack"
+          
+          - name: Configure Database Servers
+            hosts: dbservers
+            become: yes
+            tasks:
+              - name: Install MySQL
+                block:
+                  - name: Install MySQL Server
+                    apt:
+                      name: mysql-server
+                      state: present
+                  
+                  - name: Start MySQL
+                    service:
+                      name: mysql
+                      state: started
+                      enabled: yes
+                  
+                  - name: Configure MySQL
+                    copy:
+                      dest: /etc/mysql/mysql.conf.d/custom.cnf
+                      content: |
+                        [mysqld]
+                        bind-address = 0.0.0.0
+                        max_connections = 500
+                        innodb_buffer_pool_size = 256M
+                when: database_type == 'MySQL'
+              
+              - name: Install PostgreSQL
+                block:
+                  - name: Install PostgreSQL
+                    apt:
+                      name: postgresql
+                      state: present
+                  
+                  - name: Start PostgreSQL
+                    service:
+                      name: postgresql
+                      state: started
+                      enabled: yes
+                  
+                  - name: Configure PostgreSQL
+                    copy:
+                      dest: /etc/postgresql/*/main/postgresql.conf
+                      content: |
+                        listen_addresses = '*'
+                        max_connections = 500
+                        shared_buffers = 256MB
+                when: database_type == 'PostgreSQL'
+              
+              - name: Install MongoDB
+                block:
+                  - name: Add MongoDB Repository
+                    shell: |
+                      curl -fsSL https://www.mongodb.org/static/pgp/server-6.0.asc | sudo apt-key add -
+                      echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu focal/mongodb-org/6.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-6.0.list
+                      apt-get update
+                  
+                  - name: Install MongoDB
+                    apt:
+                      name: mongodb-org
+                      state: present
+                  
+                  - name: Start MongoDB
+                    service:
+                      name: mongod
+                      state: started
+                      enabled: yes
+                when: database_type == 'MongoDB'
+          
+          - name: Configure Monitoring
+            hosts: monitoring
+            become: yes
+            tasks:
+              - name: Install Prometheus
+                block:
+                  - name: Download Prometheus
+                    get_url:
+                      url: https://github.com/prometheus/prometheus/releases/download/v2.45.0/prometheus-2.45.0.linux-amd64.tar.gz
+                      dest: /tmp/prometheus.tar.gz
+                  
+                  - name: Extract Prometheus
+                    unarchive:
+                      src: /tmp/prometheus.tar.gz
+                      dest: /usr/local/bin
+                      remote_src: yes
+                  
+                  - name: Configure Prometheus
+                    copy:
+                      dest: /etc/prometheus/prometheus.yml
+                      content: |
+                        global:
+                          scrape_interval: 15s
+                        
+                        scrape_configs:
+                          - job_name: 'nodes'
+                            static_configs:
+                              - targets: ['localhost:9100']
+                  
+                  - name: Start Prometheus
+                    systemd:
+                      name: prometheus
+                      state: started
+                      enabled: yes
+                when: "'Prometheus' in monitoring"
+              
+              - name: Install Grafana
+                block:
+                  - name: Add Grafana Repository
+                    shell: |
+                      wget -q -O /usr/share/keyrings/grafana.key https://apt.grafana.com/gpg.key
+                      echo "deb [signed-by=/usr/share/keyrings/grafana.key] https://apt.grafana.com stable main" | sudo tee /etc/apt/sources.list.d/grafana.list
+                      apt-get update
+                  
+                  - name: Install Grafana
+                    apt:
+                      name: grafana
+                      state: present
+                  
+                  - name: Start Grafana
+                    service:
+                      name: grafana-server
+                      state: started
+                      enabled: yes
+                when: "'Grafana' in monitoring"
+          EOF
+
+      - name: Wait for SSH
+        run: |
+          echo "Waiting for SSH connections..."
+          for IP in ${{ steps.instances.outputs.all_ips }}; do
+            until ssh -i key.pem -o StrictHostKeyChecking=no ubuntu@$IP 'echo "SSH Ready"' 2>/dev/null; do
+              echo "Waiting for SSH on $IP..."
+              sleep 5
+            done
+          done
+
+      - name: Run Ansible Playbook
+        run: |
+          echo "Running Ansible playbook..."
+          ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -i inventory.ini playbook.yml -v
+
+      - name: Verify Deployment
+        id: verify
+        run: |
+          echo "Verifying services..."
+          REPORT="# 🚀 Deployment Verification Report\n\n"
+          
+          for IP in ${{ steps.instances.outputs.all_ips }}; do
+            echo "Checking server $IP..."
+            REPORT+="## Server $IP\n\n"
+            
+            # Check web server
+            if curl -s -I "http://$IP" | grep -q "200 OK"; then
+              REPORT+="✅ Web Server: Running\n"
+            else
+              REPORT+="❌ Web Server: Not responding\n"
+            fi
+            
+            # Check database
+            if [[ "${{ inputs.database_type }}" == "MySQL" ]]; then
+              if ssh -i key.pem -o StrictHostKeyChecking=no ubuntu@$IP "systemctl is-active mysql" 2>/dev/null; then
+                REPORT+="✅ MySQL: Running\n"
+              else
+                REPORT+="❌ MySQL: Not running\n"
+              fi
+            fi
+            
+            # Check monitoring
+            if [[ "${{ inputs.monitoring }}" == "Prometheus + Grafana" ]]; then
+              if curl -s "http://$IP:9090/-/healthy" | grep -q "Prometheus"; then
+                REPORT+="✅ Prometheus: Running\n"
+              else
+                REPORT+="❌ Prometheus: Not responding\n"
+              fi
+              
+              if curl -s "http://$IP:3000/api/health" | grep -q "ok"; then
+                REPORT+="✅ Grafana: Running\n"
+              else
+                REPORT+="❌ Grafana: Not responding\n"
+              fi
+            fi
+            
+            REPORT+="\n"
+          done
+          
+          echo "$REPORT" > verification.md
+
+      - name: Generate Final Report
+        run: |
+          cat << EOF > report.md
+          # 🚀 Infrastructure Deployment Report
+          
+          ## Configuration
+          - 🖥️ Instances: ${{ inputs.instance_count }}
+          - 💻 Type: ${{ inputs.instance_type }}
+          - 🌐 Web Stack: ${{ inputs.web_stack }}
+          - 🗄️ Database: ${{ inputs.database_type }}
+          - 📊 Monitoring: ${{ inputs.monitoring }}
+          
+          ## Access Information
+          $(for IP in ${{ steps.instances.outputs.all_ips }}; do echo "- 🌐 Server: http://$IP"; done)
+          
+          ## Services
+          - Web Servers: All nodes
+          - Database: First node
+          - Monitoring: Last node
+          $(if [[ "${{ inputs.monitoring }}" == "Prometheus + Grafana" ]]; then
+            echo "  - Prometheus: http://LAST_NODE:9090"
+            echo "  - Grafana: http://LAST_NODE:3000"
+          fi)
+          
+          ## Custom Configuration
+          - Additional Packages: ${{ inputs.custom_packages }}
+          - Extra Ports: ${{ inputs.custom_ports }}
+          $(if [[ -n "${{ inputs.custom_domain }}" ]]; then echo "- Domain: ${{ inputs.custom_domain }}"; fi)
+          
+          ## Next Steps
+          1. Access your servers using the provided IPs
+          2. Configure custom domain if provided
+          3. Set up SSL certificates if needed
+          4. Configure additional security settings
+          
+          $(cat verification.md)
+          EOF
+
+      - name: Upload Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-report
+          path: |
+            report.md
+            verification.md
+          retention-days: 1

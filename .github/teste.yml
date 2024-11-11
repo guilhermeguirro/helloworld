@@ -1,0 +1,318 @@
+name: 🚀 Interactive Multi-Host Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_type:
+        description: '🎯 Deployment Type'
+        required: true
+        type: choice
+        options:
+          - 'Web Cluster'
+          - 'Database Cluster'
+          - 'Full Stack'
+          - 'Monitoring Stack'
+      
+      hosts_count:
+        description: '🖥️ Number of Instances'
+        required: true
+        type: choice
+        options:
+          - '2'
+          - '3'
+          - '4'
+          - '5'
+      
+      instance_type:
+        description: '💻 Instance Type'
+        required: true
+        type: choice
+        options:
+          - 't2.micro'
+          - 't2.small'
+          - 't2.medium'
+      
+      environment:
+        description: '🌍 Environment'
+        required: true
+        type: choice
+        options:
+          - 'development'
+          - 'staging'
+          - 'production'
+      
+      distribution:
+        description: '🐧 Linux Distribution'
+        required: true
+        type: choice
+        options:
+          - 'ubuntu'
+          - 'amazon-linux'
+          
+      security_level:
+        description: '🔒 Security Level'
+        required: true
+        type: choice
+        options:
+          - 'basic'
+          - 'enhanced'
+          - 'maximum'
+      
+      monitoring:
+        description: '📊 Monitoring Stack'
+        required: true
+        type: choice
+        options:
+          - 'prometheus'
+          - 'elastic'
+          - 'datadog'
+          - 'none'
+
+env:
+  AWS_REGION: us-east-1
+  UBUNTU_AMI: ami-0c7217cdde317cfec  # Ubuntu 22.04
+  AMAZON_AMI: ami-0e731c8a588258d0d  # Amazon Linux 2
+  PROJECT_NAME: multi-deploy
+
+jobs:
+  create-infrastructure:
+    runs-on: ubuntu-latest
+    outputs:
+      instance_ips: ${{ steps.create-instances.outputs.instance_ips }}
+    
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create Security Group
+        id: create-sg
+        run: |
+          SG_ID=$(aws ec2 create-security-group \
+            --group-name "${{ env.PROJECT_NAME }}-${{ github.run_id }}" \
+            --description "Security group for multi-host deployment" \
+            --output text)
+          
+          echo "Created Security Group: $SG_ID"
+          echo "sg_id=$SG_ID" >> $GITHUB_OUTPUT
+          
+          # Configure security group rules
+          for port in 22 80 443 9090 9100 3000 5601 9200; do
+            aws ec2 authorize-security-group-ingress \
+              --group-id $SG_ID \
+              --protocol tcp \
+              --port $port \
+              --cidr 0.0.0.0/0
+          done
+
+      - name: Create Key Pair
+        id: create-key
+        run: |
+          KEY_NAME="${{ env.PROJECT_NAME }}-${{ github.run_id }}"
+          echo "key_name=$KEY_NAME" >> $GITHUB_OUTPUT
+          
+          aws ec2 create-key-pair \
+            --key-name "$KEY_NAME" \
+            --query 'KeyMaterial' \
+            --output text > private_key.pem
+          
+          chmod 600 private_key.pem
+          
+          # Save key for Ansible
+          mkdir -p ~/.ssh
+          cp private_key.pem ~/.ssh/
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+      - name: Create EC2 Instances
+        id: create-instances
+        run: |
+          AMI_ID=${{ inputs.distribution == 'ubuntu' && env.UBUNTU_AMI || env.AMAZON_AMI }}
+          INSTANCE_IPS=()
+          
+          for i in $(seq 1 ${{ inputs.hosts_count }}); do
+            echo "Creating instance $i..."
+            
+            INSTANCE_ID=$(aws ec2 run-instances \
+              --image-id $AMI_ID \
+              --instance-type ${{ inputs.instance_type }} \
+              --key-name ${{ steps.create-key.outputs.key_name }} \
+              --security-group-ids ${{ steps.create-sg.outputs.sg_id }} \
+              --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${{ env.PROJECT_NAME }}-$i}]" \
+              --query 'Instances[0].InstanceId' \
+              --output text)
+            
+            echo "Waiting for instance $INSTANCE_ID to be running..."
+            aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+            
+            IP=$(aws ec2 describe-instances \
+              --instance-ids $INSTANCE_ID \
+              --query 'Reservations[0].Instances[0].PublicIpAddress' \
+              --output text)
+            
+            INSTANCE_IPS+=($IP)
+          done
+          
+          echo "instance_ips=${INSTANCE_IPS[*]}" >> $GITHUB_OUTPUT
+
+  deploy:
+    needs: create-infrastructure
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Ansible
+        run: |
+          python -m pip install --upgrade pip
+          pip install ansible ansible-lint
+
+      - name: Create Ansible Inventory
+        run: |
+          echo "Creating inventory..."
+          mkdir -p inventory
+          
+          cat > inventory/hosts << EOF
+          [webservers]
+          $(for ip in ${{ needs.create-infrastructure.outputs.instance_ips }}; do echo "web-$ip ansible_host=$ip"; done)
+          
+          [all:vars]
+          ansible_user=${{ inputs.distribution == 'ubuntu' && 'ubuntu' || 'ec2-user' }}
+          ansible_ssh_private_key_file=~/.ssh/private_key.pem
+          ansible_become=yes
+          deployment_type=${{ inputs.deployment_type }}
+          environment=${{ inputs.environment }}
+          security_level=${{ inputs.security_level }}
+          monitoring_stack=${{ inputs.monitoring }}
+          EOF
+
+      - name: Create Ansible Playbook
+        run: |
+          cat > deploy.yml << EOF
+          ---
+          - name: Configure Servers
+            hosts: all
+            become: yes
+            
+            pre_tasks:
+              - name: Update package cache (Ubuntu)
+                apt:
+                  update_cache: yes
+                when: ansible_distribution == "Ubuntu"
+                
+              - name: Update package cache (Amazon Linux)
+                yum:
+                  update_cache: yes
+                when: ansible_distribution == "Amazon"
+            
+            roles:
+              - common
+              - security
+              - { role: monitoring, when: monitoring_stack != 'none' }
+              - { role: web, when: "'Web' in deployment_type" }
+              - { role: database, when: "'Database' in deployment_type" }
+            
+            tasks:
+              - name: Install common packages
+                package:
+                  name:
+                    - git
+                    - curl
+                    - vim
+                    - htop
+                    - nginx
+                  state: present
+                
+              - name: Configure firewall
+                include_tasks: "tasks/firewall-{{ ansible_os_family }}.yml"
+                
+              - name: Setup monitoring
+                include_tasks: "tasks/monitoring-{{ monitoring_stack }}.yml"
+                when: monitoring_stack != 'none'
+                
+              - name: Configure load balancing
+                include_tasks: tasks/load-balancing.yml
+                when: groups['webservers']|length > 1
+          EOF
+
+      - name: Create Security Tasks
+        run: |
+          mkdir -p tasks
+          cat > tasks/firewall-Debian.yml << EOF
+          ---
+          - name: Configure UFW
+            ufw:
+              rule: allow
+              port: "{{ item }}"
+              proto: tcp
+            loop:
+              - 22
+              - 80
+              - 443
+          
+          - name: Enable UFW
+            ufw:
+              state: enabled
+              policy: deny
+          EOF
+          
+          cat > tasks/firewall-RedHat.yml << EOF
+          ---
+          - name: Configure firewalld
+            firewalld:
+              port: "{{ item }}/tcp"
+              permanent: yes
+              state: enabled
+            loop:
+              - 22
+              - 80
+              - 443
+          EOF
+
+      - name: Create Monitoring Tasks
+        run: |
+          cat > tasks/monitoring-prometheus.yml << EOF
+          ---
+          - name: Install Prometheus
+            package:
+              name: prometheus
+              state: present
+          
+          - name: Configure Prometheus
+            template:
+              src: prometheus.yml.j2
+              dest: /etc/prometheus/prometheus.yml
+          EOF
+
+      - name: Run Ansible Playbook
+        run: |
+          echo "Running Ansible deployment..."
+          ansible-playbook -i inventory/hosts deploy.yml
+
+      - name: Verify Deployment
+        run: |
+          echo "Verifying deployment..."
+          for ip in ${{ needs.create-infrastructure.outputs.instance_ips }}; do
+            echo "Checking $ip..."
+            curl -s -I http://$ip
+          done
+
+      - name: Output Cluster Information
+        run: |
+          echo "🎉 Deployment Complete!"
+          echo "🖥️ Cluster Nodes:"
+          for ip in ${{ needs.create-infrastructure.outputs.instance_ips }}; do
+            echo "  - http://$ip"
+          done
+          echo "🔒 Security Level: ${{ inputs.security_level }}"
+          echo "📊 Monitoring: ${{ inputs.monitoring }}"
+          echo "🌍 Environment: ${{ inputs.environment }}"
+

@@ -58,7 +58,7 @@ jobs:
             --description "Deployment security group" \
             --output text)
           
-          echo "Created security group: $SG_ID"
+          echo "Created security group: $SG_ID arn:aws:ec2:${{ env.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:security-group/$SG_ID"
           
           # Add rules
           aws ec2 authorize-security-group-ingress \

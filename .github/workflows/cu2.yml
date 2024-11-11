@@ -1,0 +1,267 @@
+name: 🚀 AWS Quick Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_count:
+        description: '🖥️ Number of Servers'
+        required: true
+        type: choice
+        options: ['2', '3']
+        default: '2'
+      instance_type:
+        description: '💻 Instance Type'
+        required: true
+        type: choice
+        options:
+          - 't2.micro'
+          - 't2.small'
+        default: 't2.micro'
+      stack_type:
+        description: '🌐 Server Stack'
+        required: true
+        type: choice
+        options:
+          - 'NGINX + Node.js'
+          - 'Apache + PHP'
+        default: 'NGINX + Node.js'
+
+env:
+  AWS_REGION: us-east-1
+  UBUNTU_AMI: ami-0c7217cdde317cfec
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ansible
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create Security Group
+        id: sg
+        run: |
+          # Create unique name
+          SG_NAME="deploy-sg-${{ github.run_number }}"
+          
+          # Create security group
+          SG_ID=$(aws ec2 create-security-group \
+            --group-name "$SG_NAME" \
+            --description "Deployment security group" \
+            --output text)
+          
+          echo "Created security group: $SG_ID arn:aws:ec2:${{ env.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:security-group/$SG_ID"
+          
+          # Add rules
+          aws ec2 authorize-security-group-ingress \
+            --group-id $SG_ID \
+            --protocol tcp \
+            --port 22 \
+            --cidr 0.0.0.0/0
+          
+          aws ec2 authorize-security-group-ingress \
+            --group-id $SG_ID \
+            --protocol tcp \
+            --port 80 \
+            --cidr 0.0.0.0/0
+          
+          aws ec2 authorize-security-group-ingress \
+            --group-id $SG_ID \
+            --protocol tcp \
+            --port 443 \
+            --cidr 0.0.0.0/0
+          
+          aws ec2 authorize-security-group-ingress \
+            --group-id $SG_ID \
+            --protocol tcp \
+            --port 3000 \
+            --cidr 0.0.0.0/0
+          
+          echo "sg_id=$SG_ID" >> $GITHUB_OUTPUT
+
+      - name: Create Key Pair
+        id: key
+        run: |
+          KEY_NAME="deploy-key-${{ github.run_number }}"
+          aws ec2 create-key-pair \
+            --key-name "$KEY_NAME" \
+            --query 'KeyMaterial' \
+            --output text > key.pem
+          chmod 600 key.pem
+          echo "key_name=$KEY_NAME" >> $GITHUB_OUTPUT
+
+      - name: Launch Instances
+        id: ec2
+        run: |
+          declare -a IPS=()
+          
+          for i in $(seq 1 ${{ inputs.instance_count }}); do
+            echo "Launching instance $i..."
+            
+            INSTANCE_ID=$(aws ec2 run-instances \
+              --image-id ${{ env.UBUNTU_AMI }} \
+              --instance-type ${{ inputs.instance_type }} \
+              --key-name "${{ steps.key.outputs.key_name }}" \
+              --security-group-ids "${{ steps.sg.outputs.sg_id }}" \
+              --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=server-$i}]" \
+              --query 'Instances[0].InstanceId' \
+              --output text)
+            
+            echo "Waiting for instance $INSTANCE_ID..."
+            aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+            
+            IP=$(aws ec2 describe-instances \
+              --instance-ids $INSTANCE_ID \
+              --query 'Reservations[0].Instances[0].PublicIpAddress' \
+              --output text)
+            
+            IPS+=($IP)
+            echo "Instance $i IP: $IP"
+          done
+          
+          echo "all_ips=${IPS[*]}" >> $GITHUB_OUTPUT
+
+      - name: Configure Ansible
+        run: |
+          echo "Creating Ansible files..."
+          
+          # Create inventory
+          cat > inventory.ini << EOF
+          [webservers]
+          $(for IP in ${{ steps.ec2.outputs.all_ips }}; do echo "$IP ansible_user=ubuntu ansible_ssh_private_key_file=key.pem"; done)
+          
+          [all:vars]
+          ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+          ansible_python_interpreter=/usr/bin/python3
+          stack_type="${{ inputs.stack_type }}"
+          EOF
+          
+          # Create playbook
+          cat > playbook.yml << EOF
+          ---
+          - hosts: webservers
+            become: yes
+            tasks:
+              - name: Update apt cache
+                apt:
+                  update_cache: yes
+                  cache_valid_time: 3600
+              
+              - name: Install common packages
+                apt:
+                  name:
+                    - curl
+                    - git
+                    - vim
+                  state: present
+              
+              - name: Install NGINX
+                apt:
+                  name: nginx
+                  state: present
+                when: "'NGINX' in stack_type"
+              
+              - name: Install Node.js
+                shell: |
+                  curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+                  apt-get install -y nodejs
+                when: "'Node.js' in stack_type"
+              
+              - name: Install Apache & PHP
+                apt:
+                  name:
+                    - apache2
+                    - php
+                    - php-mysql
+                  state: present
+                when: "'Apache' in stack_type"
+              
+              - name: Create test page
+                copy:
+                  content: |
+                    <!DOCTYPE html>
+                    <html>
+                    <head>
+                      <title>Server Info</title>
+                      <style>
+                        body { 
+                          font-family: Arial, sans-serif;
+                          padding: 20px;
+                        }
+                        .info {
+                          background: #f0f0f0;
+                          padding: 20px;
+                          border-radius: 5px;
+                        }
+                      </style>
+                    </head>
+                    <body>
+                      <div class="info">
+                        <h1>Server is running!</h1>
+                        <p>Stack: {{ stack_type }}</p>
+                        <p>Host: {{ ansible_host }}</p>
+                      </div>
+                    </body>
+                    </html>
+                  dest: /var/www/html/index.html
+                  mode: '0644'
+              
+              - name: Ensure web server is running
+                service:
+                  name: "{{ 'nginx' if 'NGINX' in stack_type else 'apache2' }}"
+                  state: started
+                  enabled: yes
+          EOF
+
+      - name: Wait for SSH
+        run: |
+          for IP in ${{ steps.ec2.outputs.all_ips }}; do
+            echo "Waiting for SSH on $IP..."
+            until ssh -i key.pem -o StrictHostKeyChecking=no ubuntu@$IP 'echo "SSH Ready"' 2>/dev/null; do
+              sleep 5
+            done
+          done
+
+      - name: Deploy with Ansible
+        run: |
+          ansible-playbook -i inventory.ini playbook.yml -v
+
+      - name: Save Deployment Info
+        run: |
+          {
+            echo "# 🚀 Deployment Information"
+            echo
+            echo "## Server Details"
+            echo "- Type: ${{ inputs.instance_type }}"
+            echo "- Stack: ${{ inputs.stack_type }}"
+            echo
+            echo "## Access Information"
+            echo "### Web Access"
+            for IP in ${{ steps.ec2.outputs.all_ips }}; do
+              echo "- http://$IP"
+            done
+            echo
+            echo "### SSH Access"
+            echo "\`\`\`bash"
+            echo "# Save the key.pem file and use:"
+            echo "chmod 600 key.pem"
+            echo "ssh -i key.pem ubuntu@SERVER_IP"
+            echo "\`\`\`"
+          } > deployment.md
+
+      - name: Upload Deployment Info
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-info
+          path: |
+            key.pem
+            deployment.md
+          retention-days: 1

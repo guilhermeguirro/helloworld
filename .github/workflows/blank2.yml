@@ -1,57 +1,31 @@
-name: 🚀 Interactive AWS Deployment
+name: 🚀 Ansible Multi-Host Deploy
 
 on:
   workflow_dispatch:
     inputs:
-      server_role:
-        description: '🎯 Server Role'
+      instance_count:
+        description: 'Number of Servers'
         required: true
         type: choice
         options:
-          - '🌐 Web Server'
-          - '⚡ Application Server'
-          - '🗄️ Database Server'
-          - '📊 Monitoring Server'
-      
+          - '2'
+          - '3'
+          - '4'
       instance_type:
-        description: '💻 Instance Size'
+        description: 'Instance Type'
         required: true
         type: choice
         options:
-          - 't2.micro (1 CPU, 1GB RAM)'
-          - 't2.small (1 CPU, 2GB RAM)'
-          - 't2.medium (2 CPU, 4GB RAM)'
-      
-      server_name:
-        description: '🏷️ Server Name'
-        required: true
-        default: 'test-server'
-        type: string
-      
-      software_stack:
-        description: '📚 Software Stack'
+          - 't2.micro'
+          - 't2.small'
+      stack_type:
+        description: 'Server Stack'
         required: true
         type: choice
         options:
-          - '🔵 NGINX + Node.js'
-          - '🟢 Apache + PHP'
-          - '🟣 NGINX + Python'
-          - '🔴 NGINX + Ruby'
-      
-      security_level:
-        description: '🔒 Security Level'
-        required: true
-        type: choice
-        options:
-          - '🟢 Basic (SSH + HTTP/HTTPS)'
-          - '🟡 Standard (+ Custom Ports)'
-          - '🔴 Strict (IP Restricted)'
-      
-      install_monitoring:
-        description: '📊 Install Monitoring Tools?'
-        required: true
-        type: boolean
-        default: true
+          - 'NGINX + Node.js'
+          - 'Apache + PHP'
+          - 'NGINX + Python'
 
 env:
   AWS_REGION: us-east-1
@@ -60,216 +34,186 @@ env:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    outputs:
-      instance_ip: ${{ steps.create-ec2.outputs.public_ip }}
-      instance_id: ${{ steps.create-ec2.outputs.instance_id }}
-    
     steps:
-      - name: Display Banner
-        run: |
-          echo "🚀 Starting Interactive AWS Deployment"
-          echo "==============================="
-          echo "Role: ${{ inputs.server_role }}"
-          echo "Stack: ${{ inputs.software_stack }}"
-          echo "Security: ${{ inputs.security_level }}"
-          echo "==============================="
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - name: Configure AWS Credentials
+      - name: Configure AWS
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
 
-      - name: Create Security Group
-        id: create-sg
+      - name: Install Ansible
         run: |
-          echo "🛡️ Creating security group..."
-          
+          sudo apt-get update
+          sudo apt-get install -y ansible
+
+      - name: Create Infrastructure
+        id: create-infra
+        run: |
+          # Create security group
           SG_ID=$(aws ec2 create-security-group \
-            --group-name "${{ inputs.server_name }}-sg-${{ github.run_number }}" \
-            --description "Security group for ${{ inputs.server_name }}" \
-            --output text)
+            --group-name "ansible-cluster-${{ github.run_id }}" \
+            --description "Security group for Ansible cluster" \
+            --output json | jq -r '.GroupId')
           
-          echo "sg_id=$SG_ID" >> $GITHUB_OUTPUT
-          
-          # Basic security rules
-          echo "🔒 Configuring basic security rules..."
+          # Configure security group
           aws ec2 authorize-security-group-ingress \
             --group-id $SG_ID \
-            --protocol tcp \
-            --port 22 \
-            --cidr 0.0.0.0/0
+            --ip-permissions '[
+              {"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+              {"IpProtocol": "tcp", "FromPort": 80, "ToPort": 80, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+              {"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}
+            ]'
           
-          aws ec2 authorize-security-group-ingress \
-            --group-id $SG_ID \
-            --protocol tcp \
-            --port 80 \
-            --cidr 0.0.0.0/0
-          
-          aws ec2 authorize-security-group-ingress \
-            --group-id $SG_ID \
-            --protocol tcp \
-            --port 443 \
-            --cidr 0.0.0.0/0
-          
-          # Additional ports based on security level
-          if [[ "${{ inputs.security_level }}" != "🟢 Basic (SSH + HTTP/HTTPS)" ]]; then
-            echo "🔒 Adding additional security rules..."
-            # Add monitoring ports
-            aws ec2 authorize-security-group-ingress \
-              --group-id $SG_ID \
-              --protocol tcp \
-              --port 9090 \
-              --cidr 0.0.0.0/0
-            
-            aws ec2 authorize-security-group-ingress \
-              --group-id $SG_ID \
-              --protocol tcp \
-              --port 3000 \
-              --cidr 0.0.0.0/0
-          fi
-
-      - name: Create Key Pair
-        id: create-key
-        run: |
-          echo "🔑 Creating key pair..."
-          KEY_NAME="${{ inputs.server_name }}-key-${{ github.run_number }}"
+          # Create key pair
           aws ec2 create-key-pair \
-            --key-name "$KEY_NAME" \
+            --key-name "ansible-key-${{ github.run_id }}" \
             --query 'KeyMaterial' \
-            --output text > key.pem
+            --output text > ansible-key.pem
+          chmod 600 ansible-key.pem
           
-          chmod 600 key.pem
-          echo "key_name=$KEY_NAME" >> $GITHUB_OUTPUT
-          echo "✅ Key pair created successfully"
+          # Launch instances
+          INSTANCE_IPS=()
+          for i in $(seq 1 ${{ inputs.instance_count }}); do
+            echo "Launching instance $i..."
+            
+            INSTANCE_ID=$(aws ec2 run-instances \
+              --image-id ${{ env.UBUNTU_AMI }} \
+              --instance-type ${{ inputs.instance_type }} \
+              --key-name "ansible-key-${{ github.run_id }}" \
+              --security-group-ids $SG_ID \
+              --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=ansible-node-$i}]" \
+              --output json | jq -r '.Instances[0].InstanceId')
+            
+            aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+            
+            IP=$(aws ec2 describe-instances \
+              --instance-ids $INSTANCE_ID \
+              --query 'Reservations[0].Instances[0].PublicIpAddress' \
+              --output text)
+            
+            INSTANCE_IPS+=($IP)
+            echo "instance_${i}_ip=$IP" >> $GITHUB_OUTPUT
+          done
+          
+          # Create Ansible inventory
+          echo "[webservers]" > inventory.ini
+          for IP in "${INSTANCE_IPS[@]}"; do
+            echo "$IP ansible_user=ubuntu ansible_ssh_private_key_file=ansible-key.pem" >> inventory.ini
+          done
+          
+          echo "[all:vars]" >> inventory.ini
+          echo "ansible_ssh_common_args='-o StrictHostKeyChecking=no'" >> inventory.ini
 
-      - name: Launch EC2 Instance
-        id: create-ec2
+      - name: Create Ansible Playbook
         run: |
-          echo "🚀 Launching EC2 instance..."
-          
-          # Extract instance type
-          INSTANCE_TYPE=$(echo "${{ inputs.instance_type }}" | cut -d' ' -f1)
-          
-          INSTANCE_ID=$(aws ec2 run-instances \
-            --image-id ${{ env.UBUNTU_AMI }} \
-            --instance-type $INSTANCE_TYPE \
-            --key-name ${{ steps.create-key.outputs.key_name }} \
-            --security-group-ids ${{ steps.create-sg.outputs.sg_id }} \
-            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${{ inputs.server_name }}},{Key=Role,Value=${{ inputs.server_role }}}]" \
-            --query 'Instances[0].InstanceId' \
-            --output text)
-          
-          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
-          
-          echo "⏳ Waiting for instance to be running..."
-          aws ec2 wait instance-running --instance-ids $INSTANCE_ID
-          
-          PUBLIC_IP=$(aws ec2 describe-instances \
-            --instance-ids $INSTANCE_ID \
-            --query 'Reservations[0].Instances[0].PublicIpAddress' \
-            --output text)
-          
-          echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
-          echo "✅ Instance launched successfully at $PUBLIC_IP"
+          cat > playbook.yml << EOF
+          ---
+          - hosts: webservers
+            become: yes
+            tasks:
+              - name: Update apt cache
+                apt:
+                  update_cache: yes
+                  cache_valid_time: 3600
 
-      - name: Wait for Instance
+              - name: Install common packages
+                apt:
+                  name:
+                    - curl
+                    - wget
+                    - git
+                  state: present
+
+              - name: Install NGINX and Node.js
+                when: "${{ inputs.stack_type == 'NGINX + Node.js' }}"
+                block:
+                  - name: Install NGINX
+                    apt:
+                      name: nginx
+                      state: present
+                  
+                  - name: Install Node.js
+                    shell: |
+                      curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+                      sudo apt-get install -y nodejs
+
+              - name: Install Apache and PHP
+                when: "${{ inputs.stack_type == 'Apache + PHP' }}"
+                apt:
+                  name:
+                    - apache2
+                    - php
+                    - libapache2-mod-php
+                  state: present
+
+              - name: Install NGINX and Python
+                when: "${{ inputs.stack_type == 'NGINX + Python' }}"
+                apt:
+                  name:
+                    - nginx
+                    - python3
+                    - python3-pip
+                  state: present
+
+              - name: Create test page
+                copy:
+                  content: |
+                    <!DOCTYPE html>
+                    <html>
+                    <head><title>Server Info</title></head>
+                    <body>
+                      <h1>Server is running!</h1>
+                      <p>Stack: ${{ inputs.stack_type }}</p>
+                      <p>Hostname: {{ ansible_hostname }}</p>
+                    </body>
+                    </html>
+                  dest: /var/www/html/index.html
+
+              - name: Ensure web server is running
+                service:
+                  name: "{{ 'apache2' if '${{ inputs.stack_type }}' == 'Apache + PHP' else 'nginx' }}"
+                  state: started
+                  enabled: yes
+          EOF
+
+      - name: Wait for SSH
         run: |
-          echo "⏳ Waiting for instance to be ready..."
+          echo "Waiting for SSH to be ready..."
           sleep 60
 
-      - name: Install Software Stack
+      - name: Run Ansible Playbook
         run: |
-          echo "📦 Installing selected software stack..."
-          
-          ssh -i key.pem -o StrictHostKeyChecking=no ubuntu@${{ steps.create-ec2.outputs.public_ip }} '
-            sudo apt-get update
-            sudo apt-get install -y curl wget git
-            
-            case "${{ inputs.software_stack }}" in
-              "🔵 NGINX + Node.js")
-                echo "Installing NGINX and Node.js..."
-                sudo apt-get install -y nginx
-                curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
-                sudo apt-get install -y nodejs
-                ;;
-                
-              "🟢 Apache + PHP")
-                echo "Installing Apache and PHP..."
-                sudo apt-get install -y apache2 php libapache2-mod-php php-mysql
-                ;;
-                
-              "🟣 NGINX + Python")
-                echo "Installing NGINX and Python..."
-                sudo apt-get install -y nginx python3 python3-pip
-                sudo pip3 install flask gunicorn
-                ;;
-                
-              "🔴 NGINX + Ruby")
-                echo "Installing NGINX and Ruby..."
-                sudo apt-get install -y nginx ruby ruby-dev
-                sudo gem install bundler
-                ;;
-            esac
-            
-            if [ "${{ inputs.install_monitoring }}" = "true" ]; then
-              echo "Installing monitoring tools..."
-              sudo apt-get install -y prometheus node-exporter
-            fi
-            
-            # Create test page
-            echo "<h1>Server Setup Complete!</h1>" | sudo tee /var/www/html/index.html
-            echo "<p>Role: ${{ inputs.server_role }}</p>" | sudo tee -a /var/www/html/index.html
-            echo "<p>Stack: ${{ inputs.software_stack }}</p>" | sudo tee -a /var/www/html/index.html
-          '
+          export ANSIBLE_HOST_KEY_CHECKING=False
+          ansible-playbook -i inventory.ini playbook.yml -v
 
-      - name: Verify Installation
-        id: verify
+      - name: Verify Setup
         run: |
-          echo "🔍 Verifying installation..."
-          
-          # Check web server
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://${{ steps.create-ec2.outputs.public_ip }})
-          if [ "$HTTP_CODE" = "200" ]; then
-            echo "✅ Web server is running"
-          else
-            echo "⚠️ Web server check failed"
-          fi
-          
-          # Check monitoring if enabled
-          if [ "${{ inputs.install_monitoring }}" = "true" ]; then
-            METRICS_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://${{ steps.create-ec2.outputs.public_ip }}:9100/metrics)
-            if [ "$METRICS_CODE" = "200" ]; then
-              echo "✅ Monitoring is running"
-            else
-              echo "⚠️ Monitoring check failed"
-            fi
-          fi
+          echo "Verifying servers..."
+          for i in $(seq 1 ${{ inputs.instance_count }}); do
+            IP=$(eval echo "\${{ steps.create-infra.outputs.instance_${i}_ip }}")
+            echo "Testing server $i at $IP..."
+            curl -s -I "http://$IP"
+          done
 
-      - name: Generate Report
+      - name: Create Report
         run: |
-          cat << EOF > report.md
-          # 🚀 Deployment Report
-          
-          ## Server Information
-          - 🏷️ Name: ${{ inputs.server_name }}
-          - 🎯 Role: ${{ inputs.server_role }}
-          - 💻 Type: ${{ inputs.instance_type }}
-          - 🌐 IP: ${{ steps.create-ec2.outputs.public_ip }}
-          
-          ## Software Stack
-          - 📚 Stack: ${{ inputs.software_stack }}
-          - 📊 Monitoring: ${{ inputs.install_monitoring }}
-          
-          ## Security
-          - 🔒 Level: ${{ inputs.security_level }}
-          - 🔑 Key: ${{ steps.create-key.outputs.key_name }}
-          
-          ## Access URLs
-          - Website: http://${{ steps.create-ec2.outputs.public_ip }}
-          - Monitoring: http://${{ steps.create-ec2.outputs.public_ip }}:9090
-          EOF
+          echo "# 🚀 Deployment Report" > report.md
+          echo "" >> report.md
+          echo "## Server Information" >> report.md
+          for i in $(seq 1 ${{ inputs.instance_count }}); do
+            IP=$(eval echo "\${{ steps.create-infra.outputs.instance_${i}_ip }}")
+            echo "### Server $i" >> report.md
+            echo "- 🌐 IP: $IP" >> report.md
+            echo "- 🔗 URL: http://$IP" >> report.md
+          done
+          echo "" >> report.md
+          echo "## Stack Details" >> report.md
+          echo "- 📚 Stack Type: ${{ inputs.stack_type }}" >> report.md
+          echo "- 💻 Instance Type: ${{ inputs.instance_type }}" >> report.md
 
       - name: Upload Report
         uses: actions/upload-artifact@v4
@@ -278,14 +222,3 @@ jobs:
           path: report.md
           retention-days: 1
 
-      - name: Display Summary
-        run: |
-          echo "✅ Deployment Complete!"
-          echo "========================"
-          echo "🌐 Access your server:"
-          echo "Website: http://${{ steps.create-ec2.outputs.public_ip }}"
-          if [ "${{ inputs.install_monitoring }}" = "true" ]; then
-            echo "Monitoring: http://${{ steps.create-ec2.outputs.public_ip }}:9090"
-          fi
-          echo "========================"
-          echo "📝 Full report available in the artifacts section"

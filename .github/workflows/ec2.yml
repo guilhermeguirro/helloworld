@@ -22,9 +22,6 @@ on:
         description: 'Security Group Name'
         required: true
         default: 'allow-ssh'
-      subnet_id:
-        description: 'Subnet ID'
-        required: true
 
 jobs:
 
@@ -46,6 +43,15 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y ansible
 
+    - name: Retrieve Subnet ID
+      id: subnet
+      ansible.builtin.ec2_vpc_subnet_facts:
+        region: ${{ github.event.inputs.aws_region }}
+        filters:
+          "tag:Name": "public"
+          "state": "available"
+      register: subnets
+
     - name: Deploy EC2 Instance
       run: |
         ansible-playbook -i localhost, ec2-deploy.yml \
@@ -54,4 +60,4 @@ jobs:
           -e "image_id=${{ github.event.inputs.image_id }}" \
           -e "key_name=${{ github.event.inputs.key_name }}" \
           -e "security_group_name=${{ github.event.inputs.security_group_name }}" \
-          -e "subnet_id=${{ github.event.inputs.subnet_id }}"
+          -e "subnet_id=${{ subnets.subnets[0].id }}"

@@ -1,4 +1,4 @@
-tname: Deploy EC2 Instance
+name: Deploy EC2 Instance
 
 on:
   workflow_dispatch:
@@ -52,6 +52,12 @@ jobs:
           "state": "available"
       register: subnets
 
+    - name: Validate subnet availability
+      if: steps.subnet.outputs.subnets|length == 0
+      run: |
+        echo "No available subnets found in region ${{ github.event.inputs.aws_region }}"
+        exit 1
+
     - name: Deploy EC2 Instance
       run: |
         ansible-playbook -i localhost, ec2-deploy.yml \
@@ -61,3 +67,11 @@ jobs:
           -e "key_name=${{ github.event.inputs.key_name }}" \
           -e "security_group_name=${{ github.event.inputs.security_group_name }}" \
           -e "subnet_id=${{ subnets.subnets[0].id }}"
+      # Catch any errors and provide additional context
+      continue-on-error: true
+      if: failure()
+      run: |
+        echo "An error occurred while deploying the EC2 instance."
+        echo "Playbook output:"
+        cat ec2-deploy.yml.log
+        exit 1

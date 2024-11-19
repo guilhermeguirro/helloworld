@@ -45,16 +45,16 @@ jobs:
 
     - name: Retrieve Subnet ID
       id: subnet
-      uses: ansible-community/ansible-lint-action@master
-      with:
-        command: |
-          ansible-playbook -i localhost, ec2-deploy.yml \
-            -e "aws_region=${{ github.event.inputs.aws_region }}" \
-            -e "instance_type=${{ github.event.inputs.instance_type }}" \
-            -e "image_id=${{ github.event.inputs.image_id }}" \
-            -e "key_name=${{ github.event.inputs.key_name }}" \
-            -e "security_group_name=${{ github.event.inputs.security_group_name }}" \
-            -e "subnet_id=${{ steps.subnet.outputs.subnets[0].id }}"
+      run: |
+        ansible-playbook -i localhost, ec2-deploy.yml \
+          -e "aws_region=${{ github.event.inputs.aws_region }}" \
+          -e "instance_type=${{ github.event.inputs.instance_type }}" \
+          -e "image_id=${{ github.event.inputs.image_id }}" \
+          -e "key_name=${{ github.event.inputs.key_name }}" \
+          -e "security_group_name=${{ github.event.inputs.security_group_name }}"
+      # Register the subnet ID
+      run: |
+        echo "::set-output name=subnet_id::${{ steps.subnet.outputs.subnets[0].id }}"
 
     - name: Validate subnet availability
       if: steps.subnet.outputs.subnets|length == 0
@@ -70,7 +70,7 @@ jobs:
           -e "image_id=${{ github.event.inputs.image_id }}" \
           -e "key_name=${{ github.event.inputs.key_name }}" \
           -e "security_group_name=${{ github.event.inputs.security_group_name }}" \
-          -e "subnet_id=${{ steps.subnet.outputs.subnets[0].id }}"
+          -e "subnet_id=${{ steps.subnet.outputs.subnet_id }}"
       # Catch any errors and provide additional context
       continue-on-error: true
       if: failure()

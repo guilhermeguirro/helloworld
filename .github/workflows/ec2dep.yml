@@ -46,10 +46,9 @@ jobs:
     - name: Retrieve Subnet ID
       id: subnet
       run: |
-        ansible-playbook -i localhost, ec2-deploy.yml \
+        SUBNET_ID=$(ansible-playbook -i localhost, ec2-deploy.yml \
           -e "aws_region=${{ github.event.inputs.aws_region }}" \
-          --task-timeout=1800 | grep '"id"' | awk -F'"' '{print $4}' > subnet_id.txt
-        SUBNET_ID=$(cat subnet_id.txt)
+          --task-timeout=1800 | grep '"id"' | awk -F'"' '{print $4}')
         if [ -z "$SUBNET_ID" ]; then
           echo "No available subnets found in region ${{ github.event.inputs.aws_region }}"
           exit 1
@@ -58,21 +57,14 @@ jobs:
         echo "::set-output name=subnet_id::$SUBNET_ID"
 
     - name: Deploy EC2 Instance
-      env:
-        AWS_REGION: ${{ github.event.inputs.aws_region }}
-        INSTANCE_TYPE: ${{ github.event.inputs.instance_type }}
-        IMAGE_ID: ${{ github.event.inputs.image_id }}
-        KEY_NAME: ${{ github.event.inputs.key_name }}
-        SECURITY_GROUP_NAME: ${{ github.event.inputs.security_group_name }}
-        SUBNET_ID: ${{ steps.subnet.outputs.subnet_id }}
       run: |
         ansible-playbook -i localhost, ec2-deploy.yml \
-          -e "aws_region=$AWS_REGION" \
-          -e "instance_type=$INSTANCE_TYPE" \
-          -e "image_id=$IMAGE_ID" \
-          -e "key_name=$KEY_NAME" \
-          -e "security_group_name=$SECURITY_GROUP_NAME" \
-          -e "subnet_id=$SUBNET_ID"
+          -e "aws_region=${{ github.event.inputs.aws_region }}" \
+          -e "instance_type=${{ github.event.inputs.instance_type }}" \
+          -e "image_id=${{ github.event.inputs.image_id }}" \
+          -e "key_name=${{ github.event.inputs.key_name }}" \
+          -e "security_group_name=${{ github.event.inputs.security_group_name }}" \
+          -e "subnet_id=${{ steps.subnet.outputs.subnet_id }}"
       # Catch any errors and provide additional context
       continue-on-error: true
       if: failure()

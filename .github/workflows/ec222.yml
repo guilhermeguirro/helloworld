@@ -46,21 +46,22 @@ jobs:
     - name: Retrieve Subnet ID
       id: subnet
       run: |
-        ansible-playbook -i localhost, ec2-deploy.yml \
+        SUBNET_ID=$(ansible-playbook -i localhost, ec2-deploy.yml \
           -e "aws_region=${{ github.event.inputs.aws_region }}" \
           -e "instance_type=${{ github.event.inputs.instance_type }}" \
           -e "image_id=${{ github.event.inputs.image_id }}" \
           -e "key_name=${{ github.event.inputs.key_name }}" \
-          -e "security_group_name=${{ github.event.inputs.security_group_name }}"
-      # Register the subnet ID
-      run: |
-        echo "::set-output name=subnet_id::${{ steps.subnet.outputs.subnets[0].id }}"
+          -e "security_group_name=${{ github.event.inputs.security_group_name }}" \
+          --task-timeout=1800 | grep '"id"' | awk -F'"' '{print $4}')
+        echo "Subnet ID: $SUBNET_ID"
+        echo "::set-output name=subnet_id::$SUBNET_ID"
 
     - name: Validate subnet availability
-      if: steps.subnet.outputs.subnets|length == 0
       run: |
-        echo "No available subnets found in region ${{ github.event.inputs.aws_region }}"
-        exit 1
+        if [ -z "${{ steps.subnet.outputs.subnet_id }}" ]; then
+          echo "No available subnets found in region ${{ github.event.inputs.aws_region }}"
+          exit 1
+        fi
 
     - name: Deploy EC2 Instance
       run: |

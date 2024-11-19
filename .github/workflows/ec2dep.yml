@@ -22,6 +22,10 @@ on:
         description: 'Security Group Name'
         required: true
         default: 'allow-ssh'
+      subnet_cidr:
+        description: 'Subnet CIDR (e.g., 10.0.1.0/24)'
+        required: false
+        default: '10.0.1.0/24'
 
 jobs:
 
@@ -43,7 +47,7 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y ansible
 
-    - name: Retrieve Subnet ID
+    - name: Retrieve or Create Subnet
       id: subnet
       run: |
         SUBNET_ID=$(ansible-playbook -i localhost, ec2-deploy.yml \
@@ -51,7 +55,15 @@ jobs:
           --task-timeout=1800 | grep '"id"' | awk -F'"' '{print $4}')
         if [ -z "$SUBNET_ID" ]; then
           echo "No available subnets found in region ${{ github.event.inputs.aws_region }}"
-          exit 1
+          echo "Creating a new subnet..."
+          SUBNET_ID=$(ansible-playbook -i localhost, ec2-deploy.yml \
+            -e "aws_region=${{ github.event.inputs.aws_region }}" \
+            -e "subnet_cidr=${{ github.event.inputs.subnet_cidr }}" \
+            --task-timeout=1800 | grep '"id"' | awk -F'"' '{print $4}')
+          if [ -z "$SUBNET_ID" ]; then
+            echo "Failed to create a new subnet."
+            exit 1
+          fi
         fi
         echo "Subnet ID: $SUBNET_ID"
         echo "::set-output name=subnet_id::$SUBNET_ID"

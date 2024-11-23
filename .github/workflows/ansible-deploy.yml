@@ -95,9 +95,3 @@ jobs:
           name: deployment-report
           path: report.md
           retention-days: 1
-
-      - name: Cleanup Resources
-        if: always()
-        run: ./scripts/cleanup.sh
-        env:
-          RUN_ID: ${{ github.run_id }}

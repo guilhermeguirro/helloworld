@@ -1,4 +1,4 @@
-name: 🚀 Ansible Multi-Host Deploy
+name: 🚀 Ansible Multi-Host Deploy DEVIL
 
 on:
   workflow_dispatch:

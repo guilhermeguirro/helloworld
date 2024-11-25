@@ -12,7 +12,7 @@ on:
 
 jobs:
   add-user-and-ssh-key:
-    runs-on: [self-hosted, Linux, Prod]
+    runs-on: ubuntu-latest
     steps:
       - name: Add User and SSH Key
         run: |

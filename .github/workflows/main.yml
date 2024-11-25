@@ -1,0 +1,31 @@
+- name: Create user
+  user:
+    name: "{{ username }}"
+    create_home: yes
+    shell: /bin/bash
+    state: present
+    groups: sudo
+    append: yes
+
+- name: Set up SSH directory
+  file:
+    path: "/home/{{ username }}/.ssh"
+    state: directory
+    mode: '0700'
+    owner: "{{ username }}"
+    group: "{{ username }}"
+
+- name: Add SSH key
+  authorized_key:
+    user: "{{ username }}"
+    key: "{{ ssh_key }}"
+    state: present
+    exclusive: yes
+
+- name: Configure sudo access
+  lineinfile:
+    path: /etc/sudoers.d/{{ username }}
+    line: "{{ username }} ALL=(ALL) NOPASSWD:ALL"
+    create: yes
+    mode: '0440'
+    validate: 'visudo -cf %s'

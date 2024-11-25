@@ -1,0 +1,22 @@
+name: Add User and SSH Key
+
+on:
+  workflow_dispatch:
+    inputs:
+      add-user:
+        description: "What is the User?"
+        required: true
+      add-ssh-key:
+        description: "What is the Key?"
+        required: true
+
+jobs:
+  add-user-and-ssh-key:
+    runs-on: [self-hosted, Linux, Prod]
+    steps:
+      - name: Add User and SSH Key
+        run: |
+          echo "${{ secrets.ID_RSA }}" > id_rsa
+          chmod 600 id_rsa
+          ESCAPED_KEY=$(echo "${{ inputs.add-ssh-key }}" | sed 's/[\/&]/\\&/g')
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i id_rsa ubuntu@${{ vars.BASTION }} "sudo useradd ${{ inputs.add-user }} ; sudo mkdir -p /home/${{ inputs.add-user }}/.ssh; echo '${ESCAPED_KEY}' | sudo tee -a /home/${{ inputs.add-user }}/.ssh/authorized_keys ; sudo chown -R ${{ inputs.add-user }}:${{ inputs.add-user }} /home/${{ inputs.add-user }} ; sudo chmod 644 /home/${{ inputs.add-user }}/.ssh/authorized_keys"

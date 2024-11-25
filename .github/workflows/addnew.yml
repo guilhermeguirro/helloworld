@@ -1,0 +1,65 @@
+name: User Management
+on:
+  workflow_dispatch:
+    inputs:
+      username:
+        description: "Username to create"
+        required: true
+        type: string
+      ssh_key:
+        description: "SSH public key"
+        required: true
+        type: string
+
+jobs:
+  manage-user:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Cache Ansible
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ansible-${{ hashFiles('requirements.txt') }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install Ansible
+        run: |
+          python -m pip install --upgrade pip
+          pip install ansible ansible-lint
+
+      - name: Lint Ansible playbook
+        run: ansible-lint
+
+      - name: Create SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.ID_RSA }}" > ~/.ssh/id_rsa
+          chmod 700 ~/.ssh
+          chmod 600 ~/.ssh/id_rsa
+
+      - name: Run Ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook roles/user_management/tasks/main.yml \
+            --extra-vars "username=${{ inputs.username }} \
+                         ssh_key='${{ inputs.ssh_key }}' \
+                         bastion_host=${{ vars.BASTION }} \
+                         ssh_key_path=~/.ssh/id_rsa"
+
+      - name: Verify user creation
+        run: |
+          ssh -i ~/.ssh/id_rsa ubuntu@${{ vars.BASTION }} \
+            "id ${{ inputs.username }} && \
+             ls -la /home/${{ inputs.username }}/.ssh/authorized_keys"
+
+      - name: Cleanup
+        if: always()
+        run: rm -f ~/.ssh/id_rsa
